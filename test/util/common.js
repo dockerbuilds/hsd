@@ -103,19 +103,14 @@ common.rimraf = async function(p) {
   return await fs.rimraf(p);
 };
 
-common.event = async function event(obj, name) {
-  return new Promise((resolve) => {
-    obj.once(name, resolve);
-  });
-};
-
-common.forValue = async function(obj, key, val, timeout = 30000) {
+common.forValue = async function forValue(obj, key, val, timeout = 2000) {
   assert(typeof obj === 'object');
   assert(typeof key === 'string');
 
   const ms = 10;
   let interval = null;
   let count = 0;
+  const stack = getStack();
 
   return new Promise((resolve, reject) => {
     interval = setInterval(() => {
@@ -124,11 +119,113 @@ common.forValue = async function(obj, key, val, timeout = 30000) {
         resolve();
       } else if (count * ms >= timeout) {
         clearInterval(interval);
-        reject(new Error('Timeout waiting for value.'));
+        const error = new Error('Timeout waiting for value.');
+        error.stack = error.stack + '\n' + stack;
+        reject(error);
       }
       count += 1;
     }, ms);
   });
+};
+
+common.forEvent = async function forEvent(obj, name, count = 1, timeout = 2000) {
+  assert(typeof obj === 'object');
+  assert(typeof name === 'string');
+  assert(typeof count === 'number');
+  assert(typeof timeout === 'number');
+
+  let countdown = count;
+  const events = [];
+
+  const stack = getStack();
+
+  return new Promise((resolve, reject) => {
+    let timeoutHandler, listener;
+
+    const cleanup = function cleanup() {
+      clearTimeout(timeoutHandler);
+      obj.removeListener(name, listener);
+    };
+
+    listener = function listener(...args) {
+      events.push({
+        event: name,
+        values: [...args]
+      });
+
+      countdown--;
+      if (countdown === 0) {
+        cleanup();
+        resolve(events);
+        return;
+      }
+    };
+
+    timeoutHandler = setTimeout(() => {
+      cleanup();
+      const msg = `Timeout waiting for event ${name} `
+        + `(received ${count - countdown}/${count})\n${stack}`;
+
+      const error = new Error(msg);
+      error.stack = error.stack + '\n' + stack;
+      reject(error);
+      return;
+    }, timeout);
+
+    obj.on(name, listener);
+  });
+};
+
+common.forEventCondition = async function forEventCondition(obj, name, fn, timeout = 2000) {
+  assert(typeof obj === 'object');
+  assert(typeof name === 'string');
+  assert(typeof fn === 'function');
+  assert(typeof timeout === 'number');
+
+  const stack = getStack();
+
+  return new Promise((resolve, reject) => {
+    let timeoutHandler, listener;
+
+    const cleanup = function cleanup() {
+      clearTimeout(timeoutHandler);
+      obj.removeListener(name, listener);
+    };
+
+    listener = async function listener(...args) {
+      let res = null;
+
+      try {
+        res = await fn(...args);
+      } catch (e) {
+        cleanup();
+        e.stack = e.stack + '\n' + stack;
+        reject(e);
+        return;
+      }
+
+      if (res) {
+        cleanup();
+        resolve([...args]);
+      }
+    };
+
+    timeoutHandler = setTimeout(() => {
+      cleanup();
+      const msg = `Timeout waiting for event ${name} with condition`;
+      const error = new Error(msg);
+      error.stack = error.stack + '\n' + stack;
+      reject(error);
+      return;
+    }, timeout);
+
+    obj.on(name, listener);
+  });
+};
+
+common.sleep = async function sleep(ms) {
+  assert(typeof ms === 'number');
+  return new Promise(r => setTimeout(r, ms));
 };
 
 common.enableLogger = () => {
@@ -271,4 +368,8 @@ class TXContext {
 
     return [tx, view];
   }
+}
+
+function getStack() {
+  return new Error().stack.split('\n').slice(2).join('\n');
 }

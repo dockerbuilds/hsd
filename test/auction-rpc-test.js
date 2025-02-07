@@ -1,106 +1,61 @@
-/* eslint-env mocha */
-/* eslint prefer-arrow-callback: "off" */
-
 'use strict';
 
 const assert = require('bsert');
 const bio = require('bufio');
-const plugin = require('../lib/wallet/plugin');
 const rules = require('../lib/covenants/rules');
 const common = require('./util/common');
-const {ChainEntry, FullNode, KeyRing, MTX, Network, Path} = require('..');
-const {NodeClient, WalletClient} = require('hs-client');
+const {
+  ChainEntry,
+  KeyRing,
+  MTX,
+  Network,
+  Path
+} = require('..');
+const {forValue} = require('./util/common');
+const NodeContext = require('./util/node-context');
 
 class TestUtil {
-  constructor(options) {
-    if (!options)
-      options = Object.create(null);
-
-    if (!options.host)
-      options.host = 'localhost';
-
-    if (!options.nport)
-      options.nport = 14037;
-
-    if (!options.wport)
-      options.wport = 14039;
-
-    this.network = Network.get('regtest');
-
-    this.txs = {};
-
-    this.blocks = {};
-
-    this.node = new FullNode({
+  constructor() {
+    this.nodeCtx = new NodeContext({
       memory: true,
       workers: true,
-      network: this.network.type
+      listen: true,
+      bip37: true,
+      wallet: true
     });
 
-    this.node.use(plugin);
+    this.nodeCtx.init();
 
-    this.nclient = new NodeClient({
-      timeout: 15000,
-      host: options.host,
-      port: options.nport
-    });
+    this.network = this.nodeCtx.network;
+    this.txs = {};
+    this.blocks = {};
 
-    this.wclient = new WalletClient({
-      host: options.host,
-      port: options.wport
-    });
+    this.node = this.nodeCtx.node;
   }
 
-  /**
-   * Execute an RPC using the wallet client.
-   * @param {String}  method - RPC method
-   * @param {Array}   params - method parameters
-   * @returns {Promise} - Returns a two item array with the RPC's return value
-   * or null as the first item and an error or null as the second item.
-   */
-
-  async wrpc(method, params = []) {
-    return this.wclient.execute(method, params)
-      .then(data => data)
-      .catch((err) => {
-        throw new Error(err);
-      });
+  get nclient() {
+    return this.nodeCtx.nclient;
   }
 
-  /**
-   * Execute an RPC using the node client.
-   * @param {String}  method - RPC method
-   * @param {Array}   params - method parameters
-   * @returns {Promise<Array>} - Returns a two item array with the
-   * RPC's return value or null as the first item and an error or
-   * null as the second item.
-   */
-
-  async nrpc(method, params = []) {
-    return this.nclient.execute(method, params)
-      .then(data => data)
-      .catch((err) => {
-        throw new Error(err);
-      });
+  get wclient() {
+    return this.nodeCtx.wclient;
   }
 
-  /**
-   * Open the util and all its child objects.
-   */
+  wrpc(method, params = []) {
+    return this.nodeCtx.wrpc(method, params);
+  }
+
+  nrpc(method, params = []) {
+    return this.nodeCtx.nrpc(method, params);
+  }
 
   async open() {
     assert(!this.opened, 'TestUtil is already open.');
     this.opened = true;
 
-    await this.node.ensure();
-    await this.node.open();
-    await this.node.connect();
-    this.node.startSync();
+    await this.nodeCtx.open();
 
-    await this.nclient.open();
-    await this.wclient.open();
-
-    this.node.plugins.walletdb.wdb.on('confirmed', ((details, tx) => {
+    this.nodeCtx.wdb.on('confirmed', ((details, tx) => {
       const txid = tx.txid();
 
       if (!this.txs[txid])
@@ -117,17 +72,8 @@ class TestUtil {
     });
   }
 
-  /**
-   * Close util and all its child objects.
-   */
-
   async close() {
-    assert(this.opened, 'TestUtil is not open.');
-    this.opened = false;
-
-    await this.nclient.close();
-    await this.wclient.close();
-    await this.node.close();
+    await this.nodeCtx.close();
   }
 
   async confirmTX(txid, timeout = 5000) {
@@ -139,11 +85,13 @@ class TestUtil {
   }
 }
 
+const GNAME_SIZE = 10;
+
 describe('Auction RPCs', function() {
   this.timeout(60000);
 
   const util = new TestUtil();
-  const name = rules.grindName(2, 0, Network.get('regtest'));
+  const name = rules.grindName(GNAME_SIZE, 0, Network.get('regtest'));
   let winner, loser;
   const winnerBid = {
     bid: 5,
@@ -154,6 +102,8 @@ describe('Auction RPCs', function() {
     lockup: 10
   };
   const COIN = 1e6;
+  let signAddr, signSig;
+  const signMsg = 'The Defendants are engaged in a campaign of chaos.';
 
   const mineBlocks = async (num, wallet, account = 'default') => {
     const address = (await wallet.createAddress(account)).address;
@@ -324,11 +274,11 @@ describe('Auction RPCs', function() {
     // that same value. Note that "loser" MUST remember their original
     // bid value. If this were a wallet recovery scenario, that value
     // would have to be entered by the user without data from the blockchain.
-    const importedBlind = await util.wrpc(
+    const importedBlinds = await util.wrpc(
       'importnonce',
       [bidName, bidAddress, loserBid.bid]
     );
-    assert.strictEqual(importedBlind, bidBlind);
+    assert.strictEqual(importedBlinds[0], bidBlind);
   });
 
   it('should create REVEAL with signing paths', async () => {
@@ -405,9 +355,9 @@ describe('Auction RPCs', function() {
 
   it('should create FINALIZE with signing paths', async () => {
     // Submit TRANSFER.
-    const address = (await loser.createAddress('default')).address;
+    signAddr = (await loser.createAddress('default')).address;
     await util.wrpc('selectwallet', [winner.id]);
-    assert(await util.wrpc('sendtransfer', [name, address]));
+    assert(await util.wrpc('sendtransfer', [name, signAddr]));
 
     // Mine past TRANSFER lockup period.
     await mineBlocks(util.network.names.transferLockup, winner);
@@ -418,11 +368,123 @@ describe('Auction RPCs', function() {
     await processJSON(json, submit);
   });
 
+  it('should verify signed message', async () => {
+    // Sign and save
+    await util.wrpc('selectwallet', [loser.id]);
+    signSig = await util.wrpc('signmessagewithname', [name, signMsg]);
+
+    // Verify at current height
+    assert(await util.nrpc('verifymessagewithname', [name, signSig, signMsg]));
+
+    // Unable to verify at safe height, historical UTXO is spent
+    await assert.rejects(
+      util.nrpc('verifymessagewithname', [name, signSig, signMsg, true]),
+      {message: /Cannot find the owner's address/}
+    );
+
+    // Mine 20 blocks (safe height is still 12 confirmations even on regtest)
+    await mineBlocks(20, winner);
+
+    // Verify at current height
+    assert(await util.nrpc('verifymessagewithname', [name, signSig, signMsg]));
+
+    // Verify at safe height
+    assert(await util.nrpc('verifymessagewithname', [name, signSig, signMsg, true]));
+  });
+
   it('should create REVOKE with signing paths', async () => {
     // Create, assert, submit and mine REVOKE.
     await util.wrpc('selectwallet', [loser.id]);
     const submit = true;
     const json = await util.wrpc('createrevoke', [name]);
     await processJSON(json, submit, loser, true);
+  });
+
+  it('should not verify signed message after REVOKE', async () => {
+    await assert.rejects(
+      util.nrpc('verifymessagewithname', [name, signSig, signMsg]),
+      {message: /Invalid name state/}
+    );
+  });
+
+  it('should not verify signed message at safe height after REVOKE', async () => {
+    // This safe height is before the REVOKE was confirmed, back when
+    // the name state was still valid. However, the UTXO that owned the name
+    // in that state has been spent and no longer exists.
+    await assert.rejects(
+      util.nrpc('verifymessagewithname', [name, signSig, signMsg, true]),
+      {message: /Cannot find the owner's address/}
+    );
+  });
+
+  describe('SPV', function () {
+    const spvCtx = new NodeContext({
+      httpPort: 30000,
+      only: '127.0.0.1',
+      noDns: true,
+
+      spv: true
+    });
+
+    before(async () => {
+      await util.node.connect();
+      await spvCtx.open();
+
+      await forValue(spvCtx.chain, 'height', util.node.chain.height);
+    });
+
+    after(async () => {
+      await spvCtx.close();
+    });
+
+    it('should not get current namestate', async () => {
+      const {info} = await spvCtx.nrpc('getnameinfo', [name]);
+      assert.strictEqual(info, null);
+    });
+
+    it('should get historcial namestate at safe height', async () => {
+      const {info} = await spvCtx.nrpc('getnameinfo', [name, true]);
+      assert.strictEqual(info.name, name);
+      assert.strictEqual(info.state, 'CLOSED');
+      assert.strictEqual(info.value, loserBid.bid * COIN);
+      assert.strictEqual(info.highest, winnerBid.bid * COIN);
+    });
+
+    it('should not get current resource', async () => {
+      const json = await spvCtx.nrpc('getnameresource', [name]);
+      assert.strictEqual(json, null);
+    });
+
+    it('should get historcial resource at safe height', async () => {
+      const json = await spvCtx.nrpc('getnameresource', [name, true]);
+      assert.deepStrictEqual(
+        json,
+        {
+          records: [
+            {
+              type: 'NS',
+              ns: 'example.com.'
+            }
+          ]
+        }
+      );
+    });
+
+    it('should not verifymessagewithname', async () => {
+      // No local Urkel tree, namestate is always null
+      await assert.rejects(
+        spvCtx.nrpc('verifymessagewithname', [name, signSig, signMsg]),
+        {message: /Cannot find the name owner/}
+      );
+    });
+
+    it('should not verifymessagewithname at safe height', async () => {
+      // This time we do have a valid namestate to work with, but
+      // SPV nodes still don't have a UTXO set to get addresses from
+      await assert.rejects(
+        spvCtx.nrpc('verifymessagewithname', [name, signSig, signMsg, true]),
+        {message: /Cannot find the owner's address/}
+      );
+    });
   });
 });

@@ -1,6 +1,3 @@
-/* eslint-env mocha */
-/* eslint prefer-arrow-callback: "off" */
-
 'use strict';
 
 const assert = require('bsert');
@@ -16,7 +13,8 @@ const recursiveResolver = new Resolver({timeout: 1000});
 rootResolver.setServers([`127.0.0.1:${network.nsPort}`]);
 recursiveResolver.setServers([`127.0.0.1:${network.rsPort}`]);
 
-describe('Server Configuration', function() {
+// TODO: Enable once node.js supports ANY + SIG(0) queries (c-ares issue)
+describe.skip('Server Configuration', function() {
   describe('Full Node', function() {
     let node;
 

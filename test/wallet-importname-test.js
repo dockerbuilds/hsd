@@ -1,6 +1,3 @@
-/* eslint-env mocha */
-/* eslint prefer-arrow-callback: "off" */
-
 'use strict';
 
 const assert = require('bsert');
@@ -8,7 +5,7 @@ const Network = require('../lib/protocol/network');
 const FullNode = require('../lib/node/fullnode');
 const Address = require('../lib/primitives/address');
 const rules = require('../lib/covenants/rules');
-const {WalletClient} = require('hs-client');
+const WalletClient = require('../lib/client/wallet');
 const {forValue} = require('./util/common');
 
 const network = Network.get('regtest');
@@ -33,9 +30,10 @@ const wclient = new WalletClient({
 
 const {wdb} = node.require('walletdb');
 
-const name = rules.grindName(5, 1, network);
+const GNAME_SIZE = 10;
+const name = rules.grindName(GNAME_SIZE, 1, network);
 const nameHash = rules.hashName(name);
-const wrongName = rules.grindName(5, 1, network);
+const wrongName = rules.grindName(GNAME_SIZE, 1, network);
 const wrongNameHash = rules.hashName(wrongName);
 
 let alice, bob, aliceReceive, bobReceive;
@@ -88,8 +86,8 @@ describe('Wallet Import Name', function() {
     const ns2 = await bob.getNameStateByName(name);
     assert(ns2 === null);
 
-    await alice.sendOpen(name, false);
-    await alice.sendOpen(wrongName, false);
+    await alice.sendOpen(name);
+    await alice.sendOpen(wrongName);
 
     await mineBlocks(network.names.treeInterval);
     await wdb.rescan(0);
@@ -112,7 +110,7 @@ describe('Wallet Import Name', function() {
     // Sanity check: bids are allowed starting in the NEXT block
     await assert.rejects(
       alice.sendBid(name, 100001, 200001),
-      {message: 'Name has not reached the bidding phase yet.'}
+      {message: `Name has not reached the bidding phase yet: ${name}.`}
     );
     await mineBlocks(1);
     await wdb.rescan(0);
@@ -235,15 +233,15 @@ describe('Wallet Import Name', function() {
   });
 
   describe('import multiple / overlapping names', function() {
-    const name1 = rules.grindName(4, 1, network);
-    const name2 = rules.grindName(5, 1, network);
-    const name3 = rules.grindName(6, 1, network);
+    const name1 = rules.grindName(GNAME_SIZE, 1, network);
+    const name2 = rules.grindName(GNAME_SIZE, 1, network);
+    const name3 = rules.grindName(GNAME_SIZE, 1, network);
     let startHeight;
 
     it('should open and bid from Alice\'s wallet', async () => {
-      await alice.sendOpen(name1, false);
-      await alice.sendOpen(name2, false);
-      await alice.sendOpen(name3, false);
+      await alice.sendOpen(name1);
+      await alice.sendOpen(name2);
+      await alice.sendOpen(name3);
       startHeight = node.chain.tip.height;
 
       await mineBlocks(network.names.treeInterval + 1);

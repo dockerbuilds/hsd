@@ -1,10 +1,8 @@
-/* eslint-env mocha */
-/* eslint prefer-arrow-callback: "off" */
-
 'use strict';
 
 const assert = require('bsert');
 const random = require('bcrypto/lib/random');
+const Network = require('../lib/protocol/network');
 const MempoolEntry = require('../lib/mempool/mempoolentry');
 const Mempool = require('../lib/mempool/mempool');
 const WorkerPool = require('../lib/workers/workerpool');
@@ -17,78 +15,40 @@ const Coin = require('../lib/primitives/coin');
 const KeyRing = require('../lib/primitives/keyring');
 const Address = require('../lib/primitives/address');
 const Outpoint = require('../lib/primitives/outpoint');
+const Covenant = require('../lib/primitives/covenant');
 const Input = require('../lib/primitives/input');
+const Output = require('../lib/primitives/output');
 const Block = require('../lib/primitives/block');
 const Script = require('../lib/script/script');
 const Witness = require('../lib/script/witness');
 const CoinView = require('../lib/coins/coinview');
 const util = require('../lib/utils/util');
 const consensus = require('../lib/protocol/consensus');
+const policy = require('../lib/protocol/policy');
 const MemWallet = require('./util/memwallet');
 const ALL = Script.hashType.ALL;
 const common = require('../lib/blockchain/common');
 const VERIFY_BODY = common.flags.VERIFY_BODY;
 const rules = require('../lib/covenants/rules');
-const {types} = rules;
 const NameState = require('../lib/covenants/namestate');
 const {states} = NameState;
-const ownership = require('../lib/covenants/ownership');
+const {ownership} = require('../lib/covenants/ownership');
+const {CachedStubResolver, STUB_SERVERS} = require('./util/stub');
 
 const ONE_HASH = Buffer.alloc(32, 0x00);
 ONE_HASH[0] = 0x01;
 
-const workers = new WorkerPool({
-  enabled: true
-});
+const network = Network.get('regtest');
 
-const blocks = new BlockStore({
-  memory: true,
-  network: 'regtest'
-});
+async function getMockBlock(chain, txs = [], cb = true) {
+  if (cb) {
+    const raddr = KeyRing.generate().getAddress();
+    const mtx = new MTX();
+    mtx.addInput(new Input());
+    mtx.addOutput(raddr, 0);
+    mtx.locktime = chain.height + 1;
 
-const chain = new Chain({
-  network: 'regtest',
-  memory: true,
-  blocks,
-  workers
-});
-
-const mempool = new Mempool({
-  chain,
-  memory: true,
-  workers
-});
-
-const wallet = new MemWallet();
-
-let cachedTX = null;
-
-function dummyInput(addr, hash) {
-  const coin = new Coin();
-  coin.height = 0;
-  coin.value = 0;
-  coin.address = addr;
-  coin.hash = hash;
-  coin.index = 0;
-
-  const fund = new MTX();
-  fund.addCoin(coin);
-  fund.addOutput(addr, 70000);
-
-  const [tx, view] = fund.commit();
-
-  const entry = MempoolEntry.fromTX(tx, view, 0);
-
-  mempool.trackEntry(entry, view);
-
-  return Coin.fromTX(fund, 0, -1);
-}
-
-async function dummyBlock(txs, coinbase = false) {
-  if (coinbase) {
-    const cb = new MTX();
-    cb.locktime = chain.height + 1;
-    txs = [cb, ...txs];
+    txs = [mtx.toTX(), ...txs];
   }
 
   const view = new CoinView();
@@ -99,20 +59,16 @@ async function dummyBlock(txs, coinbase = false) {
   const now = util.now();
   const time = chain.tip.time <= now ? chain.tip.time + 1 : now;
 
-  const block = new Block({
-    version: 1,
-    prevBlock: Buffer.from(chain.tip.hash, 'hex'),
-    merkleRoot: random.randomBytes(32),
-    witnessRoot: random.randomBytes(32),
-    treeRoot: random.randomBytes(32),
-    reservedRoot: random.randomBytes(32),
-    time: time,
-    bits: await chain.getTarget(time, chain.tip),
-    nonce: 0,
-    extraNonce: Buffer.alloc(consensus.NONCE_SIZE),
-    mask: random.randomBytes(32),
-    txs: txs
-  });
+  const block = new Block();
+  block.txs = txs;
+  block.prevBlock = chain.tip.hash;
+  block.time = time;
+  block.bits = await chain.getTarget(block.time, chain.tip);
+
+  // Ensure mockblocks are unique (required for reorg testing)
+  block.merkleRoot = block.createMerkleRoot();
+  block.witnessRoot = block.createWitnessRoot();
+  block.treeRoot = chain.db.treeRoot();
 
   return [block, view];
 }
@@ -120,245 +76,88 @@ async function dummyBlock(txs, coinbase = false) {
 describe('Mempool', function() {
   this.timeout(5000);
 
-  it('should open mempool', async () => {
-    await workers.open();
-    await blocks.open();
-    await chain.open();
-    await mempool.open();
+  const originalResolver = ownership.Resolver;
+  const originalServers = ownership.servers;
+
+  before(() => {
+    ownership.Resolver = CachedStubResolver;
+    ownership.servers = STUB_SERVERS;
   });
 
-  it('should handle incoming orphans and TXs', async () => {
-    const key = KeyRing.generate();
-    const addr = key.getAddress();
-
-    const t1 = new MTX();
-    t1.addOutput(wallet.getAddress(), 50000);
-    t1.addOutput(wallet.getAddress(), 10000);
-
-    const script = Script.fromPubkeyhash(key.getHash());
-
-    t1.addCoin(dummyInput(addr, ONE_HASH));
-
-    const sig = t1.signature(0, script, 70000, key.privateKey, ALL);
-
-    t1.inputs[0].witness = Witness.fromItems([sig, key.publicKey]);
-
-    // balance: 51000
-    wallet.sign(t1);
-
-    const t2 = new MTX();
-    t2.addTX(t1, 0); // 50000
-    t2.addOutput(wallet.getAddress(), 20000);
-    t2.addOutput(wallet.getAddress(), 20000);
-
-    // balance: 49000
-    wallet.sign(t2);
-
-    const t3 = new MTX();
-    t3.addTX(t1, 1); // 10000
-    t3.addTX(t2, 0); // 20000
-    t3.addOutput(wallet.getAddress(), 23000);
-
-    // balance: 47000
-    wallet.sign(t3);
-
-    const t4 = new MTX();
-    t4.addTX(t2, 1); // 24000
-    t4.addTX(t3, 0); // 23000
-    t4.addOutput(wallet.getAddress(), 11000);
-    t4.addOutput(wallet.getAddress(), 11000);
-
-    // balance: 22000
-    wallet.sign(t4);
-
-    const f1 = new MTX();
-    f1.addTX(t4, 1); // 11000
-    f1.addOutput(new Address(), 9000);
-
-    // balance: 11000
-    wallet.sign(f1);
-
-    const fake = new MTX();
-    fake.addTX(t1, 1); // 1000 (already redeemed)
-    fake.addOutput(wallet.getAddress(), 6000); // 6000 instead of 500
-
-    // Script inputs but do not sign
-    wallet.template(fake);
-
-    // Fake signature
-    const input = fake.inputs[0];
-    input.witness.setData(0, Buffer.alloc(65, 0x00));
-    input.witness.compile();
-    // balance: 11000
-
-    {
-      await mempool.addTX(fake.toTX());
-      await mempool.addTX(t4.toTX());
-
-      const balance = mempool.getBalance();
-      assert.strictEqual(balance, 70000);
-    }
-
-    {
-      await mempool.addTX(t1.toTX());
-
-      const balance = mempool.getBalance();
-      assert.strictEqual(balance, 60000);
-    }
-
-    {
-      await mempool.addTX(t2.toTX());
-
-      const balance = mempool.getBalance();
-      assert.strictEqual(balance, 50000);
-    }
-
-    {
-      await mempool.addTX(t3.toTX());
-
-      const balance = mempool.getBalance();
-      assert.strictEqual(balance, 22000);
-    }
-
-    {
-      await mempool.addTX(f1.toTX());
-
-      const balance = mempool.getBalance();
-      assert.strictEqual(balance, 20000);
-    }
-
-    const txs = mempool.getHistory();
-    assert(txs.some((tx) => {
-      return tx.hash().equals(f1.hash());
-    }));
+  after(() => {
+    ownership.Resolver = originalResolver;
+    ownership.servers = originalServers;
   });
 
-  it('should handle locktime', async () => {
-    const key = KeyRing.generate();
-    const addr = key.getAddress();
+  describe('Mempool TXs', function() {
+    let workers, blocks, chain, mempool, wallet;
+    let cachedTX;
 
-    const tx = new MTX();
-    tx.addOutput(wallet.getAddress(), 50000);
-    tx.addOutput(wallet.getAddress(), 10000);
+    const dummyInput = (addr, hash, value = 70000) => {
+      const coin = new Coin();
+      coin.height = 0;
+      coin.value = 0;
+      coin.address = addr;
+      coin.hash = hash;
+      coin.index = 0;
 
-    const prev = Script.fromPubkeyhash(key.getHash());
-    const prevHash = random.randomBytes(32);
+      const fund = new MTX();
+      fund.addCoin(coin);
+      fund.addOutput(addr, value);
 
-    tx.addCoin(dummyInput(addr, prevHash));
-    tx.setLocktime(200);
+      const [tx, view] = fund.commit();
 
-    chain.tip.height = 200;
+      const entry = MempoolEntry.fromTX(tx, view, 0);
 
-    const sig = tx.signature(0, prev, 70000, key.privateKey, ALL);
-    tx.inputs[0].witness = Witness.fromItems([sig, key.publicKey]);
+      mempool.trackEntry(entry, view);
 
-    await mempool.addTX(tx.toTX());
-    chain.tip.height = 0;
-  });
+      return Coin.fromTX(fund, 0, -1);
+    };
 
-  it('should handle invalid locktime', async () => {
-    const key = KeyRing.generate();
-    const addr = key.getAddress();
+    before(async () => {
+      workers = new WorkerPool({
+        enabled: true,
+        size: 2
+      });
 
-    const tx = new MTX();
-    tx.addOutput(wallet.getAddress(), 50000);
-    tx.addOutput(wallet.getAddress(), 10000);
+      blocks = new BlockStore({
+        memory: true,
+        network
+      });
 
-    const prev = Script.fromPubkeyhash(key.getHash());
-    const prevHash = random.randomBytes(32);
+      chain = new Chain({
+        memory: true,
+        network,
+        blocks,
+        workers
+      });
 
-    tx.addCoin(dummyInput(addr, prevHash));
-    tx.setLocktime(200);
-    chain.tip.height = 200 - 1;
+      mempool = new Mempool({
+        chain,
+        memory: true,
+        workers
+      });
 
-    const sig = tx.signature(0, prev, 70000, key.privateKey, ALL);
-    tx.inputs[0].witness = Witness.fromItems([sig, key.publicKey]);
+      wallet = new MemWallet({ network });
 
-    let err;
-    try {
-      await mempool.addTX(tx.toTX());
-    } catch (e) {
-      err = e;
-    }
+      await workers.open();
+      await blocks.open();
+      await chain.open();
+      await mempool.open();
+    });
 
-    assert(err);
+    after(async () => {
+      await mempool.close();
+      await chain.close();
+      await blocks.close();
+      await workers.close();
+    });
 
-    chain.tip.height = 0;
-  });
+    it('should handle incoming orphans and TXs', async () => {
+      const key = KeyRing.generate();
+      const addr = key.getAddress();
 
-  it('should not cache a malleated wtx with mutated sig', async () => {
-    const key = KeyRing.generate();
-    const addr = key.getAddress();
-
-    const tx = new MTX();
-    tx.addOutput(wallet.getAddress(), 50000);
-    tx.addOutput(wallet.getAddress(), 10000);
-
-    const prevHash = random.randomBytes(32);
-
-    tx.addCoin(dummyInput(addr, prevHash));
-
-    const prevs = Script.fromPubkeyhash(key.getKeyHash());
-
-    const sig = tx.signature(0, prevs, 70000, key.privateKey, ALL);
-    sig[sig.length - 1] = 0;
-
-    tx.inputs[0].witness = new Witness([sig, key.publicKey]);
-
-    let err;
-    try {
-      await mempool.addTX(tx.toTX());
-    } catch (e) {
-      err = e;
-    }
-
-    assert(err);
-    assert(!mempool.hasReject(tx.hash()));
-  });
-
-  it('should not cache non-malleated tx without sig', async () => {
-    const key = KeyRing.generate();
-    const addr = key.getAddress();
-
-    const tx = new MTX();
-    tx.addOutput(wallet.getAddress(), 50000);
-    tx.addOutput(wallet.getAddress(), 10000);
-
-    const prevHash = random.randomBytes(32);
-
-    tx.addCoin(dummyInput(addr, prevHash));
-
-    let err;
-    try {
-      await mempool.addTX(tx.toTX());
-    } catch (e) {
-      err = e;
-    }
-
-    assert(err);
-    assert(!mempool.hasReject(tx.hash()));
-
-    cachedTX = tx;
-  });
-
-  it('should clear reject cache', async () => {
-    const tx = new MTX();
-    tx.addOutpoint(new Outpoint());
-    tx.addOutput(wallet.getAddress(), 50000);
-
-    assert(!mempool.hasReject(cachedTX.hash()));
-
-    await mempool.addBlock({ height: 1 }, [tx.toTX()], new CoinView());
-
-    assert(!mempool.hasReject(cachedTX.hash()));
-  });
-
-  it('should remove tx after being included in block', async () => {
-    const key = KeyRing.generate();
-    const addr = key.getAddress();
-
-    const t1 = new MTX();
-    {
+      const t1 = new MTX();
       t1.addOutput(wallet.getAddress(), 50000);
       t1.addOutput(wallet.getAddress(), 10000);
 
@@ -367,71 +166,428 @@ describe('Mempool', function() {
       t1.addCoin(dummyInput(addr, ONE_HASH));
 
       const sig = t1.signature(0, script, 70000, key.privateKey, ALL);
-      t1.inputs[0].witness = Witness.fromItems([sig, key.publicKey]);
-      await mempool.addTX(t1.toTX());
-    }
 
-    const t2 = new MTX();
-    {
+      t1.inputs[0].witness = Witness.fromItems([sig, key.publicKey]);
+
+      // balance: 51000
+      wallet.sign(t1);
+
+      const t2 = new MTX();
+      t2.addTX(t1, 0); // 50000
+      t2.addOutput(wallet.getAddress(), 20000);
+      t2.addOutput(wallet.getAddress(), 20000);
+
+      // balance: 49000
+      wallet.sign(t2);
+
+      const t3 = new MTX();
+      t3.addTX(t1, 1); // 10000
+      t3.addTX(t2, 0); // 20000
+      t3.addOutput(wallet.getAddress(), 23000);
+
+      // balance: 47000
+      wallet.sign(t3);
+
+      const t4 = new MTX();
+      t4.addTX(t2, 1); // 24000
+      t4.addTX(t3, 0); // 23000
+      t4.addOutput(wallet.getAddress(), 11000);
+      t4.addOutput(wallet.getAddress(), 11000);
+
+      // balance: 22000
+      wallet.sign(t4);
+
+      const f1 = new MTX();
+      f1.addTX(t4, 1); // 11000
+      f1.addOutput(new Address(), 9000);
+
+      // balance: 11000
+      wallet.sign(f1);
+
+      const fake = new MTX();
+      fake.addTX(t1, 1); // 1000 (already redeemed)
+      fake.addOutput(wallet.getAddress(), 6000); // 6000 instead of 500
+
+      // Script inputs but do not sign
+      wallet.template(fake);
+
+      // Fake signature
+      const input = fake.inputs[0];
+      input.witness.setData(0, Buffer.alloc(65, 0x00));
+      input.witness.compile();
+      // balance: 11000
+
+      {
+        await mempool.addTX(fake.toTX());
+        await mempool.addTX(t4.toTX());
+
+        const balance = mempool.getBalance();
+        assert.strictEqual(balance, 70000);
+      }
+
+      {
+        await mempool.addTX(t1.toTX());
+
+        const balance = mempool.getBalance();
+        assert.strictEqual(balance, 60000);
+      }
+
+      {
+        await mempool.addTX(t2.toTX());
+
+        const balance = mempool.getBalance();
+        assert.strictEqual(balance, 50000);
+      }
+
+      {
+        await mempool.addTX(t3.toTX());
+
+        const balance = mempool.getBalance();
+        assert.strictEqual(balance, 22000);
+      }
+
+      {
+        await mempool.addTX(f1.toTX());
+
+        const balance = mempool.getBalance();
+        assert.strictEqual(balance, 20000);
+      }
+
+      const txs = mempool.getHistory();
+      assert(txs.some((tx) => {
+        return tx.hash().equals(f1.hash());
+      }));
+    });
+
+    it('should get spent coins and reflect in coinview', async () => {
+      const wallet = new MemWallet({ network });
+      const addr = wallet.getAddress();
+
+      const dummyCoin = dummyInput(addr, random.randomBytes(32));
+
+      const mtx1 = new MTX();
+      mtx1.addOutput(wallet.getAddress(), 50000);
+      mtx1.addCoin(dummyCoin);
+
+      wallet.sign(mtx1);
+
+      const tx1 = mtx1.toTX();
+      const coin1 = Coin.fromTX(tx1, 0, -1);
+
+      const mtx2 = new MTX();
+      mtx2.addOutput(wallet.getAddress(), 10000);
+      mtx2.addOutput(wallet.getAddress(), 30000); // 10k fee
+      mtx2.addCoin(coin1);
+
+      wallet.sign(mtx2);
+
+      const tx2 = mtx2.toTX();
+
+      await mempool.addTX(tx1);
+
+      {
+        const view = await mempool.getCoinView(tx2);
+        const sview = await mempool.getSpentView(tx2);
+        assert(view.hasEntry(coin1));
+        assert(sview.hasEntry(coin1));
+        assert.strictEqual(mempool.hasCoin(coin1.hash, coin1.index), true);
+        assert.strictEqual(mempool.isSpent(coin1.hash, coin1.index), false);
+      }
+
+      await mempool.addTX(tx2);
+
+      {
+        const view = await mempool.getCoinView(tx1);
+        const sview = await mempool.getSpentView(tx1);
+        assert(!view.hasEntry(dummyCoin));
+        assert(sview.hasEntry(dummyCoin));
+        assert.strictEqual(mempool.hasCoin(coin1.hash, coin1.index), false);
+        assert.strictEqual(mempool.isSpent(coin1.hash, coin1.index), true);
+      }
+
+      {
+        const view = await mempool.getCoinView(tx2);
+        const sview = await mempool.getSpentView(tx2);
+        assert(!view.hasEntry(coin1));
+        assert(sview.hasEntry(coin1));
+        assert.strictEqual(mempool.hasCoin(coin1.hash, coin1.index), false);
+        assert.strictEqual(mempool.isSpent(coin1.hash, coin1.index), true);
+      }
+    });
+
+    it('should handle locktime', async () => {
       const key = KeyRing.generate();
       const addr = key.getAddress();
 
-      t2.addOutput(wallet.getAddress(), 50000);
-      t2.addOutput(wallet.getAddress(), 10000);
+      const tx = new MTX();
+      tx.addOutput(wallet.getAddress(), 50000);
+      tx.addOutput(wallet.getAddress(), 10000);
 
-      const script = Script.fromPubkeyhash(key.getHash());
+      const prev = Script.fromPubkeyhash(key.getHash());
+      const prevHash = random.randomBytes(32);
 
-      t2.addCoin(dummyInput(addr, ONE_HASH));
+      tx.addCoin(dummyInput(addr, prevHash));
+      tx.setLocktime(200);
 
-      const sig = t2.signature(0, script, 70000, key.privateKey, ALL);
-      t2.inputs[0].witness = Witness.fromItems([sig, key.publicKey]);
-      await mempool.addTX(t2.toTX());
-    }
+      chain.tip.height = 200;
 
-    const [block, view] = await dummyBlock([t1], true);
+      const sig = tx.signature(0, prev, 70000, key.privateKey, ALL);
+      tx.inputs[0].witness = Witness.fromItems([sig, key.publicKey]);
 
-    {
-      const entry = await mempool.getEntry(t1.hash());
-      assert.equal(entry.txid(), t1.txid());
-    }
+      await mempool.addTX(tx.toTX());
+      chain.tip.height = 0;
+    });
 
-    await mempool.addBlock(block, block.txs, view);
+    it('should handle invalid locktime', async () => {
+      const key = KeyRing.generate();
+      const addr = key.getAddress();
 
-    {
-      const entry = await mempool.getEntry(t1.hash());
-      assert.equal(entry, undefined);
-    }
+      const tx = new MTX();
+      tx.addOutput(wallet.getAddress(), 50000);
+      tx.addOutput(wallet.getAddress(), 10000);
 
-    {
-      const tx = t2.toTX();
-      const entry = await mempool.getEntry(tx.hash());
-      assert.equal(entry.txid(), tx.txid());
-    }
-  });
+      const prev = Script.fromPubkeyhash(key.getHash());
+      const prevHash = random.randomBytes(32);
 
-  it('should destroy mempool', async () => {
-    await mempool.close();
-    await chain.close();
-    await blocks.close();
-    await workers.close();
+      tx.addCoin(dummyInput(addr, prevHash));
+      tx.setLocktime(200);
+      chain.tip.height = 200 - 1;
+
+      const sig = tx.signature(0, prev, 70000, key.privateKey, ALL);
+      tx.inputs[0].witness = Witness.fromItems([sig, key.publicKey]);
+
+      let err;
+      try {
+        await mempool.addTX(tx.toTX());
+      } catch (e) {
+        err = e;
+      }
+
+      assert(err);
+
+      chain.tip.height = 0;
+    });
+
+    it('should not cache a malleated wtx with mutated sig', async () => {
+      const key = KeyRing.generate();
+      const addr = key.getAddress();
+
+      const tx = new MTX();
+      tx.addOutput(wallet.getAddress(), 50000);
+      tx.addOutput(wallet.getAddress(), 10000);
+
+      const prevHash = random.randomBytes(32);
+
+      tx.addCoin(dummyInput(addr, prevHash));
+
+      const prevs = Script.fromPubkeyhash(key.getKeyHash());
+
+      const sig = tx.signature(0, prevs, 70000, key.privateKey, ALL);
+      sig[sig.length - 1] = 0;
+
+      tx.inputs[0].witness = new Witness([sig, key.publicKey]);
+
+      let err;
+      try {
+        await mempool.addTX(tx.toTX());
+      } catch (e) {
+        err = e;
+      }
+
+      assert(err);
+      assert(!mempool.hasReject(tx.hash()));
+    });
+
+    it('should not cache non-malleated tx without sig', async () => {
+      const key = KeyRing.generate();
+      const addr = key.getAddress();
+
+      const tx = new MTX();
+      tx.addOutput(wallet.getAddress(), 50000);
+      tx.addOutput(wallet.getAddress(), 10000);
+
+      const prevHash = random.randomBytes(32);
+
+      tx.addCoin(dummyInput(addr, prevHash));
+
+      let err;
+      try {
+        await mempool.addTX(tx.toTX());
+      } catch (e) {
+        err = e;
+      }
+
+      assert(err);
+      assert(!mempool.hasReject(tx.hash()));
+
+      cachedTX = tx;
+    });
+
+    it('should clear reject cache', async () => {
+      const tx = new MTX();
+      tx.addOutpoint(new Outpoint());
+      tx.addOutput(wallet.getAddress(), 50000);
+
+      assert(!mempool.hasReject(cachedTX.hash()));
+
+      await mempool.addBlock({ height: 1 }, [tx.toTX()], new CoinView());
+
+      assert(!mempool.hasReject(cachedTX.hash()));
+    });
+
+    it('should remove tx after being included in block', async () => {
+      const key = KeyRing.generate();
+      const addr = key.getAddress();
+
+      const t1 = new MTX();
+      {
+        t1.addOutput(wallet.getAddress(), 50000);
+        t1.addOutput(wallet.getAddress(), 10000);
+
+        const script = Script.fromPubkeyhash(key.getHash());
+
+        t1.addCoin(dummyInput(addr, ONE_HASH));
+
+        const sig = t1.signature(0, script, 70000, key.privateKey, ALL);
+        t1.inputs[0].witness = Witness.fromItems([sig, key.publicKey]);
+        await mempool.addTX(t1.toTX());
+      }
+
+      const t2 = new MTX();
+      {
+        const key = KeyRing.generate();
+        const addr = key.getAddress();
+
+        t2.addOutput(wallet.getAddress(), 50000);
+        t2.addOutput(wallet.getAddress(), 10000);
+
+        const script = Script.fromPubkeyhash(key.getHash());
+
+        t2.addCoin(dummyInput(addr, ONE_HASH));
+
+        const sig = t2.signature(0, script, 70000, key.privateKey, ALL);
+        t2.inputs[0].witness = Witness.fromItems([sig, key.publicKey]);
+        await mempool.addTX(t2.toTX());
+      }
+
+      const [block, view] = await getMockBlock(chain, [t1], true);
+
+      {
+        const entry = await mempool.getEntry(t1.hash());
+        assert.equal(entry.txid(), t1.txid());
+      }
+
+      await mempool.addBlock(block, block.txs, view);
+
+      {
+        const entry = await mempool.getEntry(t1.hash());
+        assert.equal(entry, undefined);
+      }
+
+      {
+        const tx = t2.toTX();
+        const entry = await mempool.getEntry(tx.hash());
+        assert.equal(entry.txid(), tx.txid());
+      }
+    });
+
+    it('should reject absurd fee', async () => {
+      const wallet = new MemWallet({ network });
+      const addr = wallet.getAddress();
+      const funds = 10000e6;
+
+      const mtx = new MTX();
+      mtx.addCoin(
+        dummyInput(
+          addr,
+          random.randomBytes(32),
+          funds
+        )
+      );
+      mtx.addOutput(wallet.getAddress(), 0); // temp
+      wallet.sign(mtx);
+
+      const vsize = mtx.getVirtualSize();
+      const minFee = (vsize / 1000) * network.minRelay;
+      const absurdFee = minFee * policy.ABSURD_FEE_FACTOR;
+
+      // Revise with exactly absurd fee
+      mtx.outputs[0].value = funds - absurdFee - 1;
+      mtx.inputs[0].witness.items.length = 0;
+      wallet.sign(mtx);
+      const tx1 = mtx.toTX();
+
+      await assert.rejects(
+        mempool.addTX(tx1),
+        {message: /absurdly-high-fee/}
+      );
+
+      // Revise again with just under absurd fee
+      mtx.outputs[0].value = funds - absurdFee;
+      mtx.inputs[0].witness.items.length = 0;
+      wallet.sign(mtx);
+      const tx2 = mtx.toTX();
+
+      await mempool.addTX(tx2);
+    });
+
+    it('should reject too-low fee', async () => {
+      const wallet = new MemWallet({ network });
+      const addr = wallet.getAddress();
+      const funds = 10000e6;
+
+      const mtx = new MTX();
+      mtx.addCoin(
+        dummyInput(
+          addr,
+          random.randomBytes(32),
+          funds
+        )
+      );
+      mtx.addOutput(wallet.getAddress(), 0); // temp
+      wallet.sign(mtx);
+
+      const vsize = mtx.getVirtualSize();
+      const minFee = (vsize / 1000) * network.minRelay;
+
+      // Revise with just under minFee
+      mtx.outputs[0].value = funds - minFee + 1;
+      mtx.inputs[0].witness.items.length = 0;
+      wallet.sign(mtx);
+      const tx1 = mtx.toTX();
+
+      await assert.rejects(
+        mempool.addTX(tx1),
+        {message: /insufficient priority/}
+      );
+
+      // Revise again with exactly minFee
+      mtx.outputs[0].value = funds - minFee;
+      mtx.inputs[0].witness.items.length = 0;
+      wallet.sign(mtx);
+      const tx2 = mtx.toTX();
+
+      await mempool.addTX(tx2);
+    });
   });
 
   describe('Mempool disconnect and reorg handling', function () {
     const workers = new WorkerPool({
       // Must be disabled for `ownership.ignore`.
-      enabled: false
+      enabled: false,
+      size: 2
     });
 
     const blocks = new BlockStore({
       memory: true,
-      network: 'regtest'
+      network
     });
 
     const chain = new Chain({
       memory: true,
       blocks,
       workers,
-      network: 'regtest'
+      network
     });
 
     const mempool = new Mempool({
@@ -440,9 +596,10 @@ describe('Mempool', function() {
       memory: true
     });
 
+    const wallet = new MemWallet({ network });
+
     const COINBASE_MATURITY = mempool.network.coinbaseMaturity;
     const TREE_INTERVAL = mempool.network.names.treeInterval;
-    mempool.network.names.auctionStart = 0;
 
     before(async () => {
       await mempool.open();
@@ -461,9 +618,7 @@ describe('Mempool', function() {
     // Number of coins available in
     // chaincoins (100k satoshi per coin).
     const N = 100;
-    const chaincoins = new MemWallet({
-      network: 'regtest'
-    });
+    const chaincoins = new MemWallet({ network });
 
     chain.on('block', (block, entry) => {
       chaincoins.addBlock(entry, block.txs);
@@ -476,42 +631,8 @@ describe('Mempool', function() {
     chaincoins.getNameStatus = async (nameHash) => {
       assert(Buffer.isBuffer(nameHash));
       const height = chain.height + 1;
-      const state = await chain.getNextState();
-      const hardened = state.hasHardening();
-      return chain.db.getNameStatus(nameHash, height, hardened);
+      return chain.db.getNameStatus(nameHash, height);
     };
-
-    async function getMockBlock(chain, txs = [], cb = true) {
-      if (cb) {
-        const raddr = KeyRing.generate().getAddress();
-        const mtx = new MTX();
-        mtx.addInput(new Input());
-        mtx.addOutput(raddr, 0);
-        mtx.locktime = chain.height + 1;
-
-        txs = [mtx.toTX(), ...txs];
-      }
-
-      const view = new CoinView();
-      for (const tx of txs) {
-        view.addTX(tx, -1);
-      }
-
-      const time = chain.tip.time + 1;
-
-      const block = new Block();
-      block.txs = txs;
-      block.prevBlock = chain.tip.hash;
-      block.time = time;
-      block.bits = await chain.getTarget(block.time, chain.tip);
-
-      // Ensure mockblocks are unique (required for reorg testing)
-      block.merkleRoot = block.createMerkleRoot();
-      block.witnessRoot = block.createWitnessRoot();
-      block.treeRoot = chain.db.treeRoot();
-
-      return [block, view];
-    }
 
     it('should create coins in chain', async () => {
       const mtx = new MTX();
@@ -524,18 +645,18 @@ describe('Mempool', function() {
       }
 
       const cb = mtx.toTX();
-      const [block] = await getMockBlock(chain, [cb], false);
+      const [block, view] = await getMockBlock(chain, [cb], false);
       const entry = await chain.add(block, VERIFY_BODY);
 
-      await mempool._addBlock(entry, block.txs);
+      await mempool.addBlock(entry, block.txs, view);
 
       // Add 100 blocks so we don't get
       // premature spend of coinbase.
       for (let i = 0; i < 100; i++) {
-        const [block] = await getMockBlock(chain);
+        const [block, view] = await getMockBlock(chain);
         const entry = await chain.add(block, VERIFY_BODY);
 
-        await mempool._addBlock(entry, block.txs);
+        await mempool.addBlock(entry, block.txs, view);
       }
 
       chaincoins.addTX(cb);
@@ -596,8 +717,66 @@ describe('Mempool', function() {
       // Ensure mempool contents are valid in next block
       const [newBlock, newView] = await getMockBlock(chain, [tx1, tx2]);
       const newEntry = await chain.add(newBlock, VERIFY_BODY);
+      await mempool.addBlock(newEntry, newBlock.txs, newView);
+      assert.strictEqual(mempool.map.size, 0);
+    });
+
+    it('should insert resolved orphan tx after parent confirmed', async () => {
+      await mempool.reset();
+      // Mempool is empty
+      assert.strictEqual(mempool.map.size, 0);
+      // No orphans either
+      assert.strictEqual(mempool.waiting.size, 0);
+      assert.strictEqual(mempool.orphans.size, 0);
+
+      // Create first TX
+      const coin1 = chaincoins.getCoins()[0];
+      const addr = wallet.createReceive().getAddress();
+      const mtx1 = new MTX();
+      mtx1.addCoin(coin1);
+      mtx1.addOutput(addr, 90000);
+      chaincoins.sign(mtx1);
+      const tx1 = mtx1.toTX();
+      chaincoins.addTX(tx1);
+      wallet.addTX(tx1);
+
+      // Create second TX, spending output of first
+      const mtx2 = new MTX();
+      mtx2.addTX(tx1, 0);
+      mtx2.addOutput(addr, 80000);
+      wallet.sign(mtx2);
+      const tx2 = mtx2.toTX();
+      chaincoins.addTX(tx2);
+      wallet.addTX(tx2);
+
+      // Attempt to add second TX to mempool
+      await mempool.addTX(tx2);
+
+      // tx2 is orphan waiting on tx1
+      assert.strictEqual(mempool.map.size, 0);
+      assert.strictEqual(mempool.waiting.size, 1);
+      assert.strictEqual(mempool.orphans.size, 1);
+      assert(mempool.waiting.has(tx1.hash()));
+      assert(mempool.orphans.has(tx2.hash()));
+
+      // Confirm tx1 in a block
+      const [block, view] = await getMockBlock(chain, [tx1], true);
+      const entry = await chain.add(block, VERIFY_BODY);
+      await mempool.addBlock(entry, block.txs, view);
+
+      // tx2 has been resolved back in to mempool
+      assert.strictEqual(mempool.map.size, 1);
+      assert.strictEqual(mempool.waiting.size, 0);
+      assert.strictEqual(mempool.orphans.size, 0);
+      assert(mempool.map.has(tx2.hash()));
+
+      // Ensure mempool contents are valid in next block
+      const [newBlock, newView] = await getMockBlock(chain, [tx2]);
+      const newEntry = await chain.add(newBlock, VERIFY_BODY);
       await mempool._addBlock(newEntry, newBlock.txs, newView);
       assert.strictEqual(mempool.map.size, 0);
+      assert.strictEqual(mempool.waiting.size, 0);
+      assert.strictEqual(mempool.orphans.size, 0);
     });
 
     it('should handle reorg: coinbase spends', async () => {
@@ -616,7 +795,7 @@ describe('Mempool', function() {
       // Add it to block and mempool
       const [block1, view1] = await getMockBlock(chain, [cb], false);
       const entry1 = await chain.add(block1, VERIFY_BODY);
-      await mempool._addBlock(entry1, block1.txs, view1);
+      await mempool.addBlock(entry1, block1.txs, view1);
 
       // The coinbase output is a valid UTXO in the chain
       assert(await chain.getCoin(cb.hash(), 0));
@@ -647,7 +826,7 @@ describe('Mempool', function() {
         [block2, view2] = await getMockBlock(chain);
         entry2 = await chain.add(block2, VERIFY_BODY);
 
-        await mempool._addBlock(entry2, block2.txs, view2);
+        await mempool.addBlock(entry2, block2.txs, view2);
       }
 
       // Try again
@@ -660,7 +839,7 @@ describe('Mempool', function() {
       // Confirm coinbase spend in a block
       const [block3, view3] = await getMockBlock(chain, [spend]);
       const entry3 = await chain.add(block3, VERIFY_BODY);
-      await mempool._addBlock(entry3, block3.txs, view3);
+      await mempool.addBlock(entry3, block3.txs, view3);
 
       // Coinbase spend has been removed from the mempool
       assert.strictEqual(mempool.map.size, 0);
@@ -710,7 +889,7 @@ describe('Mempool', function() {
       // Add it to block and mempool
       const [block1, view1] = await getMockBlock(chain, [fund]);
       const entry1 = await chain.add(block1, VERIFY_BODY);
-      await mempool._addBlock(entry1, block1.txs, view1);
+      await mempool.addBlock(entry1, block1.txs, view1);
 
       // The fund TX output is a valid UTXO in the chain
       const spendCoin = await chain.getCoin(fund.hash(), 0);
@@ -737,7 +916,7 @@ describe('Mempool', function() {
       // Confirm spend into block
       const [block2, view2] = await getMockBlock(chain, [spend]);
       const entry2 = await chain.add(block2, VERIFY_BODY);
-      await mempool._addBlock(entry2, block2.txs, view2);
+      await mempool.addBlock(entry2, block2.txs, view2);
 
       // Spend has been removed from the mempool
       assert.strictEqual(mempool.map.size, 0);
@@ -775,7 +954,7 @@ describe('Mempool', function() {
       // Ensure mempool contents are valid in next block
       const [newBlock, newView] = await getMockBlock(chain, [fund]);
       const newEntry = await chain.add(newBlock, VERIFY_BODY);
-      await mempool._addBlock(newEntry, newBlock.txs, newView);
+      await mempool.addBlock(newEntry, newBlock.txs, newView);
       assert.strictEqual(mempool.map.size, 0);
     });
 
@@ -791,13 +970,10 @@ describe('Mempool', function() {
       const addr = chaincoins.createReceive().getAddress();
       open.addOutput(addr, 90000);
 
-      const name = rules.grindName(5, 0, mempool.network);
+      const name = rules.grindName(10, 0, mempool.network);
       const rawName = Buffer.from(name, 'ascii');
       const nameHash = rules.hashName(rawName);
-      open.outputs[0].covenant.type = types.OPEN;
-      open.outputs[0].covenant.pushHash(nameHash);
-      open.outputs[0].covenant.pushU32(0);
-      open.outputs[0].covenant.push(rawName);
+      open.outputs[0].covenant.setOpen(nameHash, rawName);
 
       chaincoins.sign(open);
       open = open.toTX();
@@ -805,7 +981,7 @@ describe('Mempool', function() {
       // Add it to block and mempool
       const [block1, view1] = await getMockBlock(chain, [open]);
       const entry1 = await chain.add(block1, VERIFY_BODY);
-      await mempool._addBlock(entry1, block1.txs, view1);
+      await mempool.addBlock(entry1, block1.txs, view1);
 
       // The open TX output is a valid UTXO in the chain
       assert(await chain.getCoin(open.hash(), 0));
@@ -827,11 +1003,12 @@ describe('Mempool', function() {
       bid.addCoin(bidCoin);
       bid.addOutput(addr, 70000);
 
-      bid.outputs[0].covenant.type = types.BID;
-      bid.outputs[0].covenant.pushHash(nameHash);
-      bid.outputs[0].covenant.pushU32(ns.height);
-      bid.outputs[0].covenant.push(rawName);
-      bid.outputs[0].covenant.pushHash(Buffer.alloc(32, 0x01));
+      bid.outputs[0].covenant.setBid(
+        nameHash,
+        ns.height,
+        rawName,
+        Buffer.alloc(32, 0x01)
+      );
 
       chaincoins.sign(bid);
       bid = bid.toTX();
@@ -852,7 +1029,7 @@ describe('Mempool', function() {
         [block2, view2] = await getMockBlock(chain);
         entry2 = await chain.add(block2, VERIFY_BODY);
 
-        await mempool._addBlock(entry2, block2.txs, view2);
+        await mempool.addBlock(entry2, block2.txs, view2);
       }
 
       // BIDDING is activated in the next block
@@ -873,7 +1050,7 @@ describe('Mempool', function() {
       // Confirm bid into block
       const [block3, view3] = await getMockBlock(chain, [bid]);
       const entry3 = await chain.add(block3, VERIFY_BODY);
-      await mempool._addBlock(entry3, block3.txs, view3);
+      await mempool.addBlock(entry3, block3.txs, view3);
 
       // Bid has been removed from the mempool
       assert.strictEqual(mempool.map.size, 0);
@@ -922,6 +1099,8 @@ describe('Mempool', function() {
     });
 
     it('should handle reorg: name claim - DNSSEC timestamp', async () => {
+      this.timeout(10000);
+
       // Mempool is empty
       await mempool.reset();
       assert.strictEqual(mempool.map.size, 0);
@@ -971,7 +1150,7 @@ describe('Mempool', function() {
       try {
         ownership.ignore = true;
         entry2 = await chain.add(block2, VERIFY_BODY);
-        await mempool._addBlock(entry2, block2.txs, view2);
+        await mempool.addBlock(entry2, block2.txs, view2);
       } finally {
         ownership.ignore = false;
       }
@@ -1008,6 +1187,8 @@ describe('Mempool', function() {
     });
 
     it('should handle reorg: name claim - block commitment', async () => {
+      this.timeout(10000);
+
       // Mempool is empty
       await mempool.reset();
       assert.strictEqual(mempool.map.size, 0);
@@ -1038,7 +1219,7 @@ describe('Mempool', function() {
         [block2, view2] = await getMockBlock(chain);
         entry2 = await chain.add(block2, VERIFY_BODY);
 
-        await mempool._addBlock(entry2, block2.txs, view2);
+        await mempool.addBlock(entry2, block2.txs, view2);
       }
 
       // Update the claim with a *very recent* block commitment
@@ -1079,7 +1260,7 @@ describe('Mempool', function() {
       try {
         ownership.ignore = true;
         entry3 = await chain.add(block3, VERIFY_BODY);
-        await mempool._addBlock(entry3, block3.txs, view3);
+        await mempool.addBlock(entry3, block3.txs, view3);
       } finally {
         ownership.ignore = false;
       }
@@ -1135,11 +1316,16 @@ describe('Mempool', function() {
       size: 2
     });
 
+    const blocks = new BlockStore({
+      memory: true,
+      network
+    });
+
     const chain = new Chain({
       memory: true,
       blocks,
       workers,
-      network: 'regtest'
+      network
     });
 
     const mempool = new Mempool({
@@ -1167,41 +1353,8 @@ describe('Mempool', function() {
     // Number of coins available in
     // chaincoins (100k satoshi per coin).
     const N = 100;
-    const chaincoins = new MemWallet();
-    const wallet = new MemWallet();
-
-    async function getMockBlock(chain, txs = [], cb = true) {
-      if (cb) {
-        const raddr = KeyRing.generate().getAddress();
-        const mtx = new MTX();
-        mtx.addInput(new Input());
-        mtx.addOutput(raddr, 0);
-        mtx.locktime = chain.height + 1;
-
-        txs = [mtx.toTX(), ...txs];
-      }
-
-      const view = new CoinView();
-      for (const tx of txs) {
-        view.addTX(tx, -1);
-      }
-
-      const now = Math.floor(Date.now() / 1000);
-      const time = chain.tip.time <= now ? chain.tip.time + 1 : now;
-
-      const block = new Block();
-      block.txs = txs;
-      block.prevBlock = chain.tip.hash;
-      block.time = time;
-      block.bits = await chain.getTarget(block.time, chain.tip);
-
-      // Ensure mockblocks are unique (required for reorg testing)
-      block.merkleRoot = block.createMerkleRoot();
-      block.witnessRoot = block.createWitnessRoot();
-      block.treeRoot = chain.db.treeRoot();
-
-      return [block, view];
-    }
+    const chaincoins = new MemWallet({ network });
+    const wallet = new MemWallet({ network });
 
     it('should create coins in chain', async () => {
       const mtx = new MTX();
@@ -1214,18 +1367,18 @@ describe('Mempool', function() {
       }
 
       const cb = mtx.toTX();
-      const [block] = await getMockBlock(chain, [cb], false);
+      const [block, view] = await getMockBlock(chain, [cb], false);
       const entry = await chain.add(block, VERIFY_BODY);
 
-      await mempool._addBlock(entry, block.txs);
+      await mempool.addBlock(entry, block.txs, view);
 
       // Add 100 blocks so we don't get
       // premature spend of coinbase.
       for (let i = 0; i < 100; i++) {
-        const [block] = await getMockBlock(chain);
+        const [block, view] = await getMockBlock(chain);
         const entry = await chain.add(block, VERIFY_BODY);
 
-        await mempool._addBlock(entry, block.txs);
+        await mempool.addBlock(entry, block.txs, view);
       }
 
       chaincoins.addTX(cb);
@@ -1323,6 +1476,290 @@ describe('Mempool', function() {
       } finally {
         util.now = original;
       }
+    });
+  });
+
+  describe('Consensus limits', function () {
+    const workers = new WorkerPool({
+      enabled: true,
+      size: 2
+    });
+
+    const blocks = new BlockStore({
+      memory: true,
+      network
+    });
+
+    const chain = new Chain({
+      memory: true,
+      blocks,
+      workers,
+      network
+    });
+
+    const mempool = new Mempool({
+      chain,
+      workers,
+      memory: true,
+      minRelay: 0,
+      rejectAbsurdFees: false
+    });
+
+    const wallet = new MemWallet({ network });
+    const address = wallet.createReceive().getAddress();
+
+    // Fake txid for inserting and spending coins
+    const txid = Buffer.alloc(32, 0xab);
+
+    // Anyone can spend address so we don't have to sign
+    const anyoneScript = new Script();
+    const anyoneAddress = Address.fromScript(anyoneScript);
+
+    before(async () => {
+      await blocks.open();
+      await mempool.open();
+      await chain.open();
+      await workers.open();
+    });
+
+    after(async () => {
+      await workers.close();
+      await chain.close();
+      await mempool.close();
+      await blocks.close();
+    });
+
+    it('should fund wallet', async () => {
+      const mtx = new MTX();
+      mtx.locktime = chain.height + 1;
+      mtx.addInput(new Input());
+      mtx.addOutput(address, 1000000);
+      const cb = mtx.toTX();
+
+      const block = new Block();
+      block.txs = [cb];
+      block.prevBlock = chain.tip.hash;
+      block.time = chain.tip.time + 1;
+      block.bits = await chain.getTarget(block.time, chain.tip);
+      block.merkleRoot = block.createMerkleRoot();
+      block.witnessRoot = block.createWitnessRoot();
+      block.treeRoot = chain.db.treeRoot();
+      const entry = await chain.add(block, VERIFY_BODY);
+
+      // Crazy hack to spend coinbase
+      chain.height = 200;
+
+      wallet.addBlock(entry, block.txs);
+    });
+
+    it('should not insert TX with too many OPENs', async () => {
+      let mtx = new MTX();
+      for (let i = consensus.MAX_BLOCK_OPENS + 1; i > 0; i--) {
+        const name = `name_${i}`;
+        mtx.outputs.push(new Output({
+          value: 0,
+          address,
+          covenant: {
+            type: 2, // OPEN
+            items: [
+              rules.hashName(name),      // nameHash
+              Buffer.from([0, 0, 0, 0]), // height is always 0x00000000 for OPEN
+              Buffer.from(name, 'ascii') // raw name
+            ]
+          }
+        }));
+      }
+      mtx = await wallet._create(mtx);
+      const tx = mtx.toTX();
+
+      await assert.rejects(
+        mempool.insertTX(tx),
+        {message: /bad-txns-opens/}
+      );
+    });
+
+    it('should not insert TX with too many UPDATEs', async () => {
+      let mtx = new MTX();
+      for (let i = consensus.MAX_BLOCK_UPDATES + 1; i > 0; i--) {
+        const name = `name_${i}`;
+        mtx.outputs.push(new Output({
+          value: 0,
+          address,
+          covenant: {
+            type: 7, // UPDATE
+            items: [
+              rules.hashName(name),      // nameHash
+              Buffer.from([0, 0, 0, 0]), // height doesn't matter for this test
+              Buffer.from([0])           // empty data resource
+            ]
+          }
+        }));
+      }
+      mtx = await wallet._create(mtx);
+      const tx = mtx.toTX();
+
+      await assert.rejects(
+        mempool.insertTX(tx),
+        {message: /bad-txns-updates/}
+      );
+    });
+
+    it('should not insert TX with too many RENEWs', async () => {
+      let mtx = new MTX();
+      for (let i = consensus.MAX_BLOCK_RENEWALS + 1; i > 0; i--) {
+        const name = `name_${i}`;
+        mtx.outputs.push(new Output({
+          value: 0,
+          address,
+          covenant: {
+            type: 8, // RENEW
+            items: [
+              rules.hashName(name),      // nameHash
+              Buffer.from([0, 0, 0, 0]), // height doesn't matter for this test
+              chain.tip.hash             // renewal block
+            ]
+          }
+        }));
+      }
+      mtx = await wallet._create(mtx);
+      const tx = mtx.toTX();
+
+      await assert.rejects(
+        mempool.insertTX(tx),
+        {message: /bad-txns-renewals/}
+      );
+    });
+
+    it('should insert TX with max OPENs', async () => {
+      let mtx = new MTX();
+      for (let i = consensus.MAX_BLOCK_OPENS; i > 0; i--) {
+        const name = `name_${i}`;
+        mtx.outputs.push(new Output({
+          value: 0,
+          address,
+          covenant: {
+            type: 2, // OPEN
+            items: [
+              rules.hashName(name),      // nameHash
+              Buffer.from([0, 0, 0, 0]), // height is always 0x00000000 for OPEN
+              Buffer.from(name, 'ascii') // raw name
+            ]
+          }
+        }));
+      }
+      mtx = await wallet._create(mtx);
+      const tx = mtx.toTX();
+
+      await mempool.reset();
+      assert.strictEqual(mempool.map.size, 0);
+      await mempool.insertTX(tx);
+      assert.strictEqual(mempool.map.size, 1);
+    });
+
+    it('should insert names and coins into chain', async () => {
+      // Crazy hack to register names on chain without auction or miner
+      chain.db.start();
+      const view = new CoinView();
+
+      for (let i = 1000; i > 0; i--) {
+        // Create name owner
+        const name = `name_${i}`;
+        const nameHash = rules.hashName(name);
+        const coin = new Coin();
+        coin.hash = txid;
+        coin.index = i;
+        coin.address = anyoneAddress;
+        coin.covenant = new Covenant();
+        coin.covenant.type = 7, // UPDATE
+        coin.covenant.items = [
+          nameHash,
+          Buffer.from([0, 0, 0, 0]), // height doesn't matter for this test
+          Buffer.from([0])           // empty data resource
+        ];
+
+        // Insert UTXO
+        view.addCoin(coin);
+        chain.db.saveView(view);
+
+        // Insert nameState
+        const ns = new NameState();
+        ns.name = Buffer.from(name, 'ascii');
+        ns.nameHash = nameHash;
+        ns.height = 0;
+        ns.owner = new Outpoint(txid, i);
+        ns.registered = true;
+        await chain.db.txn.insert(nameHash, ns.encode());
+      }
+
+      await chain.db.commit();
+    });
+
+    it('should insert TX with max UPDATEs', async () => {
+      const mtx = new MTX();
+      for (let i = consensus.MAX_BLOCK_UPDATES; i > 0; i--) {
+        const name = `name_${i}`;
+
+        mtx.inputs.push(new Input({
+          prevout: new Outpoint(txid, i),
+          witness: new Witness([
+            Buffer.from([0x51]), // OP_TRUE
+            anyoneScript.encode()
+          ])
+        }));
+
+        mtx.outputs.push(new Output({
+          value: 0,
+          address: anyoneAddress,
+          covenant: {
+            type: 7, // UPDATE
+            items: [
+              rules.hashName(name),      // nameHash
+              Buffer.from([0, 0, 0, 0]), // height doesn't matter for this test
+              Buffer.from([0])           // empty data resource
+            ]
+          }
+        }));
+      }
+      const tx = mtx.toTX();
+
+      await mempool.reset();
+      assert.strictEqual(mempool.map.size, 0);
+      await mempool.insertTX(tx);
+      assert.strictEqual(mempool.map.size, 1);
+    });
+
+    it('should insert TX with max RENEWs', async () => {
+      const mtx = new MTX();
+      for (let i = consensus.MAX_BLOCK_RENEWALS; i > 0; i--) {
+        const name = `name_${i}`;
+
+        mtx.inputs.push(new Input({
+          prevout: new Outpoint(txid, i),
+          witness: new Witness([
+            Buffer.from([0x51]), // OP_TRUE
+            anyoneScript.encode()
+          ])
+        }));
+
+        mtx.outputs.push(new Output({
+          value: 0,
+          address: anyoneAddress,
+          covenant: {
+            type: 8, // RENEW
+            items: [
+              rules.hashName(name),      // nameHash
+              Buffer.from([0, 0, 0, 0]), // height doesn't matter for this test
+              chain.tip.hash             // renewal block
+            ]
+          }
+        }));
+      }
+      const tx = mtx.toTX();
+
+      await mempool.reset();
+      assert.strictEqual(mempool.map.size, 0);
+      await mempool.insertTX(tx);
+      assert.strictEqual(mempool.map.size, 1);
     });
   });
 });

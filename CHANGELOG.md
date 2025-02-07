@@ -1,5 +1,282 @@
 # HSD Release Notes & Changelog
 
+## Unreleased
+
+### Wallet Changes
+
+#### Wallet HTTP API
+  - `POST /wallet/:id/zap` response object has a new property: `zapped: number`,
+    indicating the number of transactions that were zapped.
+  - `GET /wallet/:id/name/:name` now accepts an `own` parameter and only returns
+    the namestate when the wallet owns the name.
+
+#### Wallet/WalletDB API
+  - `Wallet.zap` now returns the number of transactions zapped instead of their hashes.
+
+#### hs-client Wallet
+  - `getName` now accepts an `options` object with an `own` property.
+
+
+## v7.0.0
+
+**When upgrading to this version of hsd, you must pass `--wallet-migrate=5` when
+you run it for the first time.**
+
+### Primitives
+- TX Changes:
+  - tx.test no longer updates the filter.
+  - Introduce TX.testAndMaybeUpdate method for potentially updating filter while
+    testing. (old tx.test)
+
+### Node Changes
+  Add support for the interactive rescan, that allows more control over rescan
+process and allows parallel rescans.
+
+#### Node HTTP API
+  - `GET /` or `getInfo()` now has more properties:
+    - `treeRootHeight` - height at which the block txns are accumulated
+      in the current branch.
+    - `indexers`
+      - `indexTX` - is tx indexer enabled.
+      - `indexAddress` - is addr indexer enabled.
+    - `options` 
+      - `spv` is the Node SPV?
+      - `prune` does node have pruning enabled.
+    - `treeCompaction`
+      - `compacted` - whethere tree is compacted or not.
+      - `compactOnInit` - is tree compaction on init enabled.
+      - `compactInterval` - what is the current compaction interval config.
+      - `nextCompaction` - when will the next compaction trigger after restart.
+      - `lastCompaction` - when was the last compaction run.
+  - Introduce `scan interactive` hook (start, filter, fullLock)
+  - Add `get median time` hook to get median time past for a blockhash.
+  - Add `get entries` hook to get entries. Similar to `get hashes`, but returns
+    encoded entries.
+
+### hs-client Node
+  - Introduce `scanInteractive` method that starts interactive rescan.
+    - expects ws hook for `block rescan interactive` params `rawEntry, rawTXs`
+      that returns scanAction object.
+    - expects ws hook for `block rescan interactive abort` param `message`.
+  - Add `getMempoolRejectionFilter` and `checkMempoolRejectionFilter` NodeClient
+  aliases.
+  - Add `getFee`, an HTTP alternative to estimateFee socket call.
+  - Adds `getEntries(start, end)` that returns encoded chain entries.
+
+### Wallet Changes
+- Add migration that recalculates txdb balances to fix any inconsistencies.
+- Wallet will now use `interactive scan` for initial sync(on open) and rescan.
+
+#### Configuration
+- Wallet now has option `wallet-migrate-no-rescan`/`migrate-no-rescan` if you
+  want to disable rescan when migration recommends it. It may result in the
+  incorrect txdb state, but can be useful if you know the issue does not affect
+  your wallet or is not critical.
+- Add `--wallet-preload-all` (or `--preload-all` for standalone wallet node)
+  that will open all wallets before starting other services (e.g. HTTP).
+  By default this is set to `false`.
+- Add `--wallet-max-history-txs` (or `--max-history-txs` for standalone wallet
+  node) that will be the hard limit of confirmed and unconfirmed histories.
+
+#### Wallet API
+
+- WalletNode now emits `open` and `close` events.
+- WalletDB Now emits events for: `open`, `close`, `connect`, `disconnect`.
+- WalletDB
+  - `open()` no longer calls `connect` and needs separate call `connect`.
+  - `open()` no longer calls scan, instead only rollbacks and waits for
+    sync to do the rescan.
+  - emits events for: `open`, `close`, `connect`, `disconnect`, `sync done`.
+  - Wallet now has additional methods for quering history:
+    - `listUnconfirmed(acc, { limit, reverse })` - Get first or last `limit`
+      unconfirmed transactions.
+    - `listUnconfirmedAfter(acc, { hash, limit, reverse })` - Get first or last `limit`
+      unconfirmed transactions after/before tx with hash: `hash`.
+    - `listUnconfirmedFrom(acc, { hash, limit, reverse })` - Get first or last `limit`
+      unconfirmed transactions after/before tx with hash `hash`, inclusive.
+    - `listUnconfirmedByTime(acc, { time, limit, reverse })` - Get first or last
+      `limit` unconfirmed transactions after/before `time`, inclusive.
+    - `listHistory(acc, { limit, reverse })` - Get first or last `limit`
+      unconfirmed/confirmed transactions.
+    - `listHistoryAfter(acc, { hash, limit, reverse })` - Get first or last `limit`
+      unconfirmed/confirmed transactions after/before tx with hash `hash`.
+    - `listHistoryFrom(acc, { hash, limit, reverse })` - Get first or last `limit`
+      confirmed/unconfirmed transactions after/before tx with hash `hash`, inclusive.
+    - `listUnconfirmedByTime(acc, { time, limit, reverse })` - Get first or last
+      `limit` confirmed/unconfirmed transactions after/before `time`, inclusive.
+    - NOTE: Default is ascending order, from the oldest.
+
+##### Wallet HTTP API
+  - All transaction creating endpoints now accept `hardFee` for specifying the
+    exact fee.
+  - All transaction sending endpoints now fundlock/queue tx creation. (no more
+    conflicting transactions)
+  - Add options to `getNames` for passing `own`.
+  - Rename `createAuctionTxs` to `createAuctionTXs`.
+  - All `bid` serializations will include `height` of the bid. (`-1` if
+    it was migrated not-owned bid)
+    - `GET /wallet/:id/auction` (`getAuctions`)
+    - `GET /wallet/:id/auction/:name` (`getAuctionByName`)
+    - `GET /wallet/:id/bid` (`getBids`)
+    - `GET /wallet/:id/bid/:name` (`getBidsByName`)
+  - All `reveal` serializations will include `bidPrevout` of the bid. (`null` if
+  it was migrated not-owned reveal)
+    - `GET /wallet/:id/auction` (`getAuctions`)
+    - `GET /wallet/:id/auction/:name` (`getAuctionByName`)
+    - `GET /wallet/:id/reveal` (`getReveals`)
+    - `GET /wallet/:id/reveal/:name` (`getRevealsByName`)
+  - `GET /wallet/:id/tx/history` - The params are now `time`, `after`,
+  `limit`, and `reverse`.
+  - `GET /wallet/:id/tx/unconfirmed` - The params are are same as above.
+
+These endpoints have been deprecated:
+  - `GET /wallet/:id/tx/range` - Instead use the `time` param for the history and
+    unconfirmed endpoints.
+  - `GET /wallet/:id/tx/last` - Instead use `reverse` param for the history and
+    unconfirmed endpoints.
+
+##### Examples
+
+```
+GET /wallet/:id/tx/history?after=<txid>&limit=50&reverse=false
+GET /wallet/:id/tx/history?after=<txid>&limit=50&reverse=true
+```
+By using `after=<txid>` we can anchor pages so that results will not shift
+when new blocks and transactions arrive. With `reverse=true` we can change
+the order the transactions are returned as _latest to genesis_. The
+`limit=<number>` specifies the maximum number of transactions to return
+in the result.
+
+```
+GET /wallet/:id/tx/history?time=<median-time-past>&limit=50&reverse=false
+GET /wallet/:id/tx/history?time=<median-time-past>&limit=50&reverse=true
+```
+The param `time` is in epoch seconds and indexed based on median-time-past
+(MTP) and `date` is ISO 8601 format. Because multiple transactions can share
+the same time, this can function as an initial query, and then switch to the
+above `after` format for the following pages.
+
+```
+GET /wallet/:id/tx/unconfirmed?after=<txid>&limit=50&reverse=false
+GET /wallet/:id/tx/unconfirmed?after=<txid>&limit=50&reverse=true
+GET /wallet/:id/tx/unconfirmed?time=<time-received>&limit=50&reverse=false
+```
+The same will apply to unconfirmed transactions. The `time` is in epoch
+seconds and indexed based on when the transaction was added to the wallet.
+
+##### Wallet RPC
+
+The following new methods have been added:
+  - `listhistory` - List history with a limit and in reverse order.
+  - `listhistoryafter` - List history after a txid _(subsequent pages)_.
+  - `listhistorybytime` - List history by giving a timestamp in epoch seconds
+    _(block median time past)_.
+  - `listunconfirmed` - List unconfirmed transactions with a limit and in
+    reverse order.
+  - `listunconfirmedafter` - List unconfirmed transactions after a txid
+    _(subsequent pages)_.
+  - `listunconfirmedbytime` - List unconfirmed transactions by time they
+    where added.
+
+The following methods have been deprecated:
+
+- `listtransactions` - Use `listhistory` and the related methods and the
+  `after` argument for results that do not shift when new blocks arrive.
+
+##### Wallet CLI (hsw-cli)
+  - `history` now accepts new args on top of `--account`: `--reverse`,
+    `--limit`, `--after`, `--after`.
+  - `pending` now accepts new args, same as above.
+
+
+### Client changes
+#### Wallet HTTP Client
+
+  - `getHistory` and `Wallet.getHistory` no longer accept `account`,
+    instead accepts object with properties: `account`, `time`, `after`,
+    `limit`, and `reverse`.
+  - `getPending` and `Wallet.getPending` have the same changes as
+    `getHistory` above.
+
+## v6.0.0
+
+### Node and Wallet HTTP API
+  Validation errors, request paremeter errors or bad HTTP requests will no
+longer return (and log) `500` status code, instead will return `400`.
+
+### Wallet Changes
+#### Configuration
+  `hsd.conf` can now be used to define wallet options, when wallet is running as
+a plugin. Configurations with `wallet-` prefix will be passed to the wallet.
+`hsd.conf` wont be used if the wallet is running in standalone mode.
+
+- Remove `check-lookahead` option from walletdb.
+
+#### Wallet API
+
+- HTTP Changes:
+  - `/wallet/:id/open` no longer accepts `force` flag. (it was not used)
+- RPC Changes:
+  - `createopen` and `sendopen` no longer accept `force` as an argument. (was not used)
+  - Introduce new API to modify account: `PATCH /wallet/:id/account/:account`.
+
+## v5.0.0
+
+**When upgrading to this version of hsd, you must pass `--wallet-migrate=2` when
+you run it for the first time.**
+
+### Node API changes
+
+- HTTP API endpoint `/` (`hsd-cli getinfo`) now includes "public" networking settings.
+
+- RPCs `getnameinfo` `getnameresource` `verifymessagewithname` and `getnamebyhash`
+now accept an additional boolean parameter `safe` which will resolve the name
+from the Urkel tree at the last "safe height" (committed tree root with > 12
+confirmations). SPV nodes can use this option and retrieve Urkel proofs from the
+p2p network to respond to these calls.
+
+- New RPC methods:
+  - `decoderesource` like `decodescript` accepts hex string as input and returns
+  JSON formatted DNS records resource.
+
+### Wallet changes
+
+- HTTP Changes:
+  - Wallet and account create methods now accept `lookahead` values up to `2^32 - 1`.
+
+- New RPC methods:
+  - `createbatch` and `sendbatch` create batch transactions with any number
+  of outputs with any combination of covenants.
+
+- Updates related to nonces and blinds
+  - Multisig wallets will compute nonces based on the LOWEST public key in the
+  group.
+  This makes multiparty bidding and revealing more deteministic. Older versions
+  would always use the wallet's OWN public key. To preserve compatability with
+  older software:
+    - RPC method `importnonce` now returns an array of blinds instead of a
+    single blind.
+    - HTTP endpoint `/wallet/:id/nonce/:name`'s response replaces 2 string
+    fields (`nonce`, `blind`) with arrays of the same type (`nonces`, `blinds`)
+
+## v4.0.0
+
+**When upgrading to this version of hsd you must pass
+`--chain-migrate=3` when you run it for the first time.**
+
+### Node changes
+ - `FullNode` and `SPVNode` now accept the option `--agent` which adds a string
+  to the user-agent of the node (which will already contain hsd version) and is
+  sent to peers in the version packet. Strings must not contain slashes and
+  total user-agent string must be less than 255 characters.
+
+  - `FullNode` parses new configuration option `--compact-tree-on-init` and
+  `--compact-tree-init-interval` which will compact the Urkel Tree when the node
+  first opens, by deleting historical data. It will try to compact it again
+  after `tree-init-interval` has passed. Compaction will keep up to the last 288
+  blocks worth of tree data on disk (7-8 tree intervals) exposing the node to a
+  similar deep reorganization vulnerability as a chain-pruning node.
+
 ## v3.0.0
 
 **When upgrading to this version of hsd you must pass
@@ -18,8 +295,10 @@
 ### Wallet API changes
 
 - New RPC methods:
-  - `signmessagewithname`: Like `signmessage` but uses a name instead of an address. The owner's address will be used to sign the message.
-  - `verifymessagewithname`: Like `verifymessage` but uses a name instead of an address. The owner's address will be used to verify the message.
+  - `signmessagewithname`: Like `signmessage` but uses a name instead of an
+    address. The owner's address will be used to sign the message.
+  - `verifymessagewithname`: Like `verifymessage` but uses a name instead of an
+    address. The owner's address will be used to verify the message.
 
 - New wallet creation accepts parameter `language` to generate the mnemonic phrase.
 

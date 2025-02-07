@@ -1,6 +1,3 @@
-/* eslint-env mocha */
-/* eslint prefer-arrow-callback: "off" */
-
 'use strict';
 
 const assert = require('bsert');
@@ -36,6 +33,11 @@ let bobAcct0Info, bobNames, bobBalance, bobHistory;
 
 const aliceBlinds = [];
 const bobBlinds = [];
+
+const historyOptions = {
+  limit: 100,
+  reverse: false
+};
 
 async function mineBlocks(n, addr) {
   addr = addr ? addr : new Address().toString('regtest');
@@ -78,7 +80,7 @@ describe('Wallet Deep Clean', function() {
       const name = i < 5 ? `alice${i}` : `bob${i}`;
       const array = i < 5 ? aliceBlinds : bobBlinds;
 
-      await w.sendOpen(name, false, {account: 0});
+      await w.sendOpen(name, {account: 0});
       await mineBlocks(network.names.treeInterval + 2);
 
       // Send two bids so there is a winner/loser and name gets a value
@@ -144,12 +146,12 @@ describe('Wallet Deep Clean', function() {
   it('should save wallet data', async () => {
     aliceBalance = await alice.getBalance();
     aliceNames = await alice.getNames();
-    aliceHistory = await alice.getHistory();
+    aliceHistory = await alice.listHistory(-1, historyOptions);
     aliceAcct0Info = await alice.getAccount(0);
 
     bobBalance = await bob.getBalance();
     bobNames = await bob.getNames();
-    bobHistory = await bob.getHistory();
+    bobHistory = await bob.listHistory(-1, historyOptions);
     bobAcct0Info = await bob.getAccount(0);
   });
 
@@ -160,12 +162,12 @@ describe('Wallet Deep Clean', function() {
   it('should have erased wallet data', async () => {
     const aliceBalance2 = await alice.getBalance();
     const aliceNames2 = await alice.getNames();
-    const aliceHistory2 = await alice.getHistory();
+    const aliceHistory2 = await alice.listHistory(-1, historyOptions);
     const aliceAcct0Info2 = await alice.getAccount(0);
 
     const bobBalance2 = await bob.getBalance();
     const bobNames2 = await bob.getNames();
-    const bobHistory2 = await bob.getHistory();
+    const bobHistory2 = await bob.listHistory(-1, historyOptions);
     const bobAcct0Info2 = await bob.getAccount(0);
 
     // Account metadata is fine
@@ -196,12 +198,12 @@ describe('Wallet Deep Clean', function() {
   it('should have recovered wallet data', async () => {
     const aliceBalance2 = await alice.getBalance();
     const aliceNames2 = await alice.getNames();
-    const aliceHistory2 = await alice.getHistory();
+    const aliceHistory2 = await alice.listHistory(-1, historyOptions);
     const aliceAcct0Info2 = await alice.getAccount(0);
 
     const bobBalance2 = await bob.getBalance();
     const bobNames2 = await bob.getNames();
-    const bobHistory2 = await bob.getHistory();
+    const bobHistory2 = await bob.listHistory(-1, historyOptions);
     const bobAcct0Info2 = await bob.getAccount(0);
 
     assert.deepStrictEqual(aliceBalance, aliceBalance2);

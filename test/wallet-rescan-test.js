@@ -1,569 +1,893 @@
-/* eslint-env mocha */
-/* eslint prefer-arrow-callback: "off" */
-/* eslint no-implicit-coercion: "off" */
-
 'use strict';
 
 const assert = require('bsert');
-const FullNode = require('../lib/node/fullnode');
-const MemWallet = require('./util/memwallet');
 const Network = require('../lib/protocol/network');
 const Address = require('../lib/primitives/address');
-const rules = require('../lib/covenants/rules');
-const {Resource} = require('../lib/dns/resource');
-const {forValue} = require('./util/common');
+const HDPublicKey = require('../lib/hd/public');
+const NodesContext = require('./util/nodes-context');
+const {forEvent, forEventCondition} = require('./util/common');
+const {Balance, getWClientBalance, getBalance} = require('./util/balance');
 
-const network = Network.get('regtest');
+// Definitions:
+//  Gapped txs/addresses - addresses with lookahead + 1 gap when deriving.
+//
+// Setup:
+//  - Standalone Node (no wallet) responsible for progressing network.
+//  - Wallet Node (with wallet) responsible for rescanning.
+//  - Wallet SPV Node (with wallet) responsible for rescanning.
+//  - Wallet Standalone Node responsible for rescanning.
+//  - Wallet SPV Standalone Node responsible for rescanning.
+//
+// Test cases:
+//  - TX deeper depth -> TX shallower depth for derivation (Second tx is discovered first)
+//  - TX with outputs -> deeper, deep, shallow - derivation depths.
+//    (Outputs are discovered from shallower to deeper)
+//  - Replicate both transactions in the same block on rescan.
+//  - Replicate both transactions when receiving tip.
+//
+// If per block derivation lookahead is higher than wallet lookahed
+// recovery is impossible. This tests situation where in block
+// derivation depth is lower than wallet lookahead.
 
-const {
-  treeInterval,
-  biddingPeriod,
-  revealPeriod,
-  transferLockup
-} = network.names;
+const combinations = [
+  { SPV: false, STANDALONE: false, name: 'Full/Plugin' },
+  { SPV: false, STANDALONE: true, name: 'Full/Standalone' },
+  { SPV: true, STANDALONE: false, name: 'SPV/Plugin' }
+  // Not supported.
+  // { SPV: true, STANDALONE: true, name: 'SPV/Standalone' }
+];
 
-describe('Wallet rescan with namestate transitions', function() {
-  describe('Only sends OPEN', function() {
-    // Bob runs a full node with wallet plugin
-    const node = new FullNode({
-      network: network.type,
-      memory: true,
-      plugins: [require('../lib/wallet/plugin')]
-    });
-    node.on('error', (err) => {
-      assert(false, err);
-    });
+const noSPVcombinations = combinations.filter(c => !c.SPV);
+const regtest = Network.get('regtest');
 
-    const {wdb} = node.require('walletdb');
-    let bob, bobAddr;
+describe('Wallet rescan/addBlock', function() {
+  for (const {SPV, STANDALONE, name} of noSPVcombinations) {
+  describe(`rescan/addBlock gapped addresses (${name} Integration)`, function() {
+    this.timeout(5000);
+    const TEST_LOOKAHEAD = 20;
 
-    // Alice is some other wallet on the network
-    const alice = new MemWallet({ network });
-    const aliceAddr = alice.getAddress();
+    const MAIN = 0;
+    const TEST_ADDBLOCK = 1;
+    const TEST_RESCAN = 2;
 
-    // Connect MemWallet to chain as minimally as possible
-    node.chain.on('connect', (entry, block) => {
-      alice.addBlock(entry, block.txs);
-    });
-    alice.getNameStatus = async (nameHash) => {
-      assert(Buffer.isBuffer(nameHash));
-      const height = node.chain.height + 1;
-      const state = await node.chain.getNextState();
-      const hardened = state.hasHardening();
-      return node.chain.db.getNameStatus(nameHash, height, hardened);
-    };
+    const WALLET_NAME = 'test';
+    const ACCOUNT = 'default';
 
-    const NAME = rules.grindName(4, 4, network);
+    const regtest = Network.get('regtest');
 
-    // Hash of the FINALIZE transaction
-    let aliceFinalizeHash;
-
-    async function mineBlocks(n, addr) {
-      addr = addr ? addr : new Address().toString('regtest');
-      const blocks = [];
-      for (let i = 0; i < n; i++) {
-        const block = await node.miner.mineBlock(null, addr);
-        await node.chain.add(block);
-        blocks.push(block);
-      }
-
-      return blocks;
-    }
-
-    async function sendTXs() {
-      const aliceTX = await alice.send({
-        outputs: [{
-          address: aliceAddr,
-          value: 20000
-        }]
-      });
-      alice.addTX(aliceTX.toTX());
-      await node.mempool.addTX(aliceTX.toTX());
-      await bob.send({
-        outputs: [{
-          address: bobAddr,
-          value: 20000
-        }]
-      });
-    }
+    /** @type {NodesContext} */
+    let nodes;
+    let minerWallet, minerAddress;
+    let main, addBlock, rescan;
 
     before(async () => {
-      await node.open();
-      bob = await wdb.create();
-      bobAddr = await bob.receiveAddress();
+      // Initial node is the one that progresses the network.
+      nodes = new NodesContext(regtest, 1);
+      // MAIN_WALLET = 0
+      nodes.init({
+        wallet: true,
+        standalone: true,
+        memory: true,
+        noDNS: true
+      });
+
+      // Add the testing node.
+      // TEST_ADDBLOCK = 1
+      nodes.addNode({
+        spv: SPV,
+        wallet: true,
+        memory: true,
+        standalone: STANDALONE,
+        noDNS: true
+      });
+
+      // Add the rescan test node.
+      // TEST_RESCAN = 2
+      nodes.addNode({
+        spv: SPV,
+        wallet: true,
+        memory: true,
+        standalone: STANDALONE,
+        noDNS: true
+      });
+
+      await nodes.open();
+
+      const mainWClient = nodes.context(MAIN).wclient;
+      minerWallet = nodes.context(MAIN).wclient.wallet('primary');
+      minerAddress = (await minerWallet.createAddress('default')).address;
+
+      const mainWallet = await mainWClient.createWallet(WALLET_NAME, {
+        lookahead: TEST_LOOKAHEAD
+      });
+      assert(mainWallet);
+
+      const master = await mainWClient.getMaster(WALLET_NAME);
+
+      const addBlockWClient = nodes.context(TEST_ADDBLOCK).wclient;
+      const addBlockWalletResult = await addBlockWClient.createWallet(WALLET_NAME, {
+        lookahead: TEST_LOOKAHEAD,
+        mnemonic: master.mnemonic.phrase
+      });
+      assert(addBlockWalletResult);
+
+      const rescanWClient = nodes.context(TEST_RESCAN).wclient;
+      const rescanWalletResult = await rescanWClient.createWallet(WALLET_NAME, {
+        lookahead: TEST_LOOKAHEAD,
+        mnemonic: master.mnemonic.phrase
+      });
+      assert(rescanWalletResult);
+
+      main = {};
+      main.client = mainWClient.wallet(WALLET_NAME);
+      await main.client.open();
+      main.wdb = nodes.context(MAIN).wdb;
+
+      addBlock = {};
+      addBlock.client = addBlockWClient.wallet(WALLET_NAME);
+      await addBlock.client.open();
+      addBlock.wdb = nodes.context(TEST_ADDBLOCK).wdb;
+
+      rescan = {};
+      rescan.client = rescanWClient.wallet(WALLET_NAME);
+      await rescan.client.open();
+      rescan.wdb = nodes.context(TEST_RESCAN).wdb;
+
+      await nodes.generate(MAIN, 10, minerAddress);
     });
 
     after(async () => {
-      await node.close();
+      await nodes.close();
+      await nodes.destroy();
     });
 
-    it('should fund wallets', async () => {
-      const blocks = 10;
-      await mineBlocks(blocks, aliceAddr);
-      await mineBlocks(blocks, bobAddr);
+    // Prepare for the rescan and addBlock tests.
+    it('should send gapped txs on each block', async () => {
+      const expectedRescanBalance = await getBalance(main.client, ACCOUNT);
+      const height = nodes.height(MAIN);
+      const blocks = 5;
 
-      const bobBal  = await bob.getBalance();
-      assert.strictEqual(bobBal.confirmed, blocks * 2000 * 1e6);
-      assert.strictEqual(alice.balance, blocks * 2000 * 1e6);
-    });
+      // 1 address per block, all of them gapped.
+      // Start after first gap, make sure rescan has no clue.
+      const all = await generateGappedAddresses(main.client, blocks + 1, regtest);
+      await deriveAddresses(main.client, all[all.length - 1].depth);
+      const addresses = all.slice(1);
+      // give addBlock first address.
+      await deriveAddresses(addBlock.client, addresses[0].depth - TEST_LOOKAHEAD);
 
-    it('should run auction', async () => {
-      // Poor Bob, all he does is send an OPEN but his wallet will
-      // watch all the other activity including TRANSFERS for this name
-      await bob.sendOpen(NAME, true);
-      // Scatter unrelated TXs throughout the test.
-      // This will ensure that txdb.removeBlock() removes TXs
-      // in the reverse order from when they were added
-      await sendTXs();
-      const openBlocks = await mineBlocks(1);
-      // Coinbase plus open
-      assert.strictEqual(openBlocks[0].txs.length, 4);
+      const condFn = entry => entry.height === blocks + height;
+      const mainWalletBlocks = forEventCondition(main.wdb, 'block connect', condFn);
+      const addBlockWalletBlocks = forEventCondition(addBlock.wdb, 'block connect', condFn);
+      const rescanWalletBlocks = forEventCondition(rescan.wdb, 'block connect', condFn);
 
-      // Advance to bidding phase
-      await mineBlocks(treeInterval);
-      await forValue(alice, 'height', node.chain.height);
+      for (let i = 0; i < blocks; i++) {
+        await minerWallet.send({
+          outputs: [{
+            address: addresses[i].address.toString(regtest),
+            value: 1e6
+          }]
+        });
 
-      // Alice sends only bid
-      await sendTXs();
-      const aliceBid = await alice.createBid(NAME, 20000, 20000);
-      await node.mempool.addTX(aliceBid.toTX());
-      const bidBlocks = await mineBlocks(1);
-      assert.strictEqual(bidBlocks[0].txs.length, 4);
-
-      // Advance to reveal phase
-      await mineBlocks(biddingPeriod);
-      await sendTXs();
-      const aliceReveal = await alice.createReveal(NAME);
-      await node.mempool.addTX(aliceReveal.toTX());
-      const revealBlocks = await mineBlocks(1);
-      assert.strictEqual(revealBlocks[0].txs.length, 4);
-
-      // Close auction
-      await mineBlocks(revealPeriod);
-
-      // Alice registers
-      await sendTXs();
-      const aliceRegister = await alice.createRegister(
-        NAME,
-        Resource.fromJSON({records:[]})
-      );
-      await node.mempool.addTX(aliceRegister.toTX());
-
-      const registerBlocks = await mineBlocks(1);
-      assert.strictEqual(registerBlocks[0].txs.length, 4);
-    });
-
-    it('should get namestate', async () => {
-      const ns = await bob.getNameStateByName(NAME);
-      // Bob has the namestate
-      assert(ns);
-
-      // Bob is not the name owner
-      const {hash, index} = ns.owner;
-      const coin = await bob.getCoin(hash, index);
-      assert.strictEqual(coin, null);
-
-      // Name is not in mid-TRANSFER
-      assert.strictEqual(ns.transfer, 0);
-    });
-
-    it('should process TRANSFER', async () => {
-      // Alice transfers the name to her own address
-      await sendTXs();
-      const aliceTransfer = await alice.createTransfer(NAME, aliceAddr);
-      await node.mempool.addTX(aliceTransfer.toTX());
-      const transferBlocks = await mineBlocks(1);
-      assert.strictEqual(transferBlocks[0].txs.length, 4);
-
-      // Bob detects the TRANSFER even though it doesn't involve him at all
-      const ns = await bob.getNameStateByName(NAME);
-      assert(ns);
-      assert.strictEqual(ns.transfer, node.chain.height);
-
-      // Bob's wallet has not indexed the TRANSFER
-      const bobTransfer = await bob.getTX(aliceTransfer.hash());
-      assert.strictEqual(bobTransfer, null);
-    });
-
-    it('should fully rescan', async () => {
-      // Complete chain rescan
-      await wdb.rescan(0);
-      await forValue(wdb, 'height', node.chain.height);
-
-      // No change
-      const ns = await bob.getNameStateByName(NAME);
-      assert(ns);
-      assert.strictEqual(ns.transfer, node.chain.height);
-    });
-
-    it('should process FINALIZE', async () => {
-      await mineBlocks(transferLockup);
-
-      // Alice finalizes the name
-      await sendTXs();
-      const aliceFinalize = await alice.createFinalize(NAME);
-      await node.mempool.addTX(aliceFinalize.toTX());
-      const finalizeBlocks = await mineBlocks(1);
-      assert.strictEqual(finalizeBlocks[0].txs.length, 4);
-
-      aliceFinalizeHash = aliceFinalize.hash();
-
-      // Bob detects the FINALIZE even though it doesn't involve him at all
-      const ns = await bob.getNameStateByName(NAME);
-      assert(ns);
-      assert.bufferEqual(ns.owner.hash, aliceFinalizeHash);
-
-      // Bob's wallet has not indexed the FINALIZE
-      const bobFinalize = await bob.getTX(aliceFinalize.hash());
-      assert.strictEqual(bobFinalize, null);
-    });
-
-    it('should fully rescan', async () => {
-      // Complete chain rescan
-      await wdb.rescan(0);
-      await forValue(wdb, 'height', node.chain.height);
-
-      // No change
-      const ns = await bob.getNameStateByName(NAME);
-      assert(ns);
-      assert.bufferEqual(ns.owner.hash, aliceFinalizeHash);
-    });
-
-    it('should process TRANSFER (again)', async () => {
-      // Alice transfers the name to her own address
-      await sendTXs();
-      const aliceTransfer = await alice.createTransfer(NAME, aliceAddr);
-      await node.mempool.addTX(aliceTransfer.toTX());
-      const transferBlocks = await mineBlocks(1);
-      assert.strictEqual(transferBlocks[0].txs.length, 4);
-
-      // Bob detects the TRANSFER even though it doesn't involve him at all
-      const ns = await bob.getNameStateByName(NAME);
-      assert(ns);
-      assert.strictEqual(ns.transfer, node.chain.height);
-
-      // Bob's wallet has not indexed the TRANSFER
-      const bobTransfer = await bob.getTX(aliceTransfer.hash());
-      assert.strictEqual(bobTransfer, null);
-    });
-
-    it('should process REVOKE', async () => {
-      // Alice revokes the name
-      await sendTXs();
-      const aliceRevoke = await alice.createRevoke(NAME);
-      await node.mempool.addTX(aliceRevoke.toTX());
-      const revokeBlocks = await mineBlocks(1);
-      assert.strictEqual(revokeBlocks[0].txs.length, 4);
-
-      // Bob detects the REVOKE even though it doesn't involve him at all
-      const ns = await bob.getNameStateByName(NAME);
-      assert(ns);
-      assert.strictEqual(ns.revoked, node.chain.height);
-
-      // Bob's wallet has not indexed the REVOKE
-      const bobTransfer = await bob.getTX(aliceRevoke.hash());
-      assert.strictEqual(bobTransfer, null);
-    });
-
-    it('should fully rescan', async () => {
-      // Complete chain rescan
-      await wdb.rescan(0);
-      await forValue(wdb, 'height', node.chain.height);
-
-      // No change
-      const ns = await bob.getNameStateByName(NAME);
-      assert(ns);
-      assert.strictEqual(ns.revoked, node.chain.height);
-    });
-  });
-
-  describe('Bids, loses, shallow rescan', function() {
-    // Bob runs a full node with wallet plugin
-    const node = new FullNode({
-      network: network.type,
-      memory: true,
-      plugins: [require('../lib/wallet/plugin')]
-    });
-    node.on('error', (err) => {
-      assert(false, err);
-    });
-
-    const {wdb} = node.require('walletdb');
-    let bob, bobAddr;
-
-    // Alice is some other wallet on the network
-    const alice = new MemWallet({ network });
-    const aliceAddr = alice.getAddress();
-
-    // Connect MemWallet to chain as minimally as possible
-    node.chain.on('connect', (entry, block) => {
-      alice.addBlock(entry, block.txs);
-    });
-    alice.getNameStatus = async (nameHash) => {
-      assert(Buffer.isBuffer(nameHash));
-      const height = node.chain.height + 1;
-      const state = await node.chain.getNextState();
-      const hardened = state.hasHardening();
-      return node.chain.db.getNameStatus(nameHash, height, hardened);
-    };
-
-    const NAME = rules.grindName(4, 4, network);
-
-    // Block that confirmed the bids
-    let bidBlockHash;
-    // Hash of the FINALIZE transaction
-    let aliceFinalizeHash;
-
-    async function mineBlocks(n, addr) {
-      addr = addr ? addr : new Address().toString('regtest');
-      const blocks = [];
-      for (let i = 0; i < n; i++) {
-        const block = await node.miner.mineBlock(null, addr);
-        await node.chain.add(block);
-        blocks.push(block);
+        await nodes.generate(MAIN, 1, minerAddress);
       }
 
-      return blocks;
-    }
+      await Promise.all([
+        mainWalletBlocks,
+        addBlockWalletBlocks,
+        rescanWalletBlocks
+      ]);
 
-    async function sendTXs() {
-      const aliceTX = await alice.send({
-        outputs: [{
-          address: aliceAddr,
-          value: 20000
-        }]
-      });
-      alice.addTX(aliceTX.toTX());
-      await node.mempool.addTX(aliceTX.toTX());
-      await bob.send({
-        outputs: [{
-          address: bobAddr,
-          value: 20000
-        }]
-      });
-    }
+      const rescanBalance = await getBalance(rescan.client, ACCOUNT);
+      assert.deepStrictEqual(rescanBalance, expectedRescanBalance);
+      // before the rescan test.
+      await deriveAddresses(rescan.client, addresses[0].depth - TEST_LOOKAHEAD);
+    });
+
+    it('should receive gapped txs on each block (addBlock)', async () => {
+      const expectedBalance = await getBalance(main.client, ACCOUNT);
+      const addBlockBalance = await getBalance(addBlock.client, ACCOUNT);
+      assert.deepStrictEqual(addBlockBalance, expectedBalance);
+
+      const mainInfo = await main.client.getAccount(ACCOUNT);
+      const addBlockInfo = await addBlock.client.getAccount(ACCOUNT);
+      assert.deepStrictEqual(addBlockInfo, mainInfo);
+    });
+
+    it('should receive gapped txs on each block (rescan)', async () => {
+      const expectedBalance = await getBalance(main.client, ACCOUNT);
+      const expectedInfo = await main.client.getAccount(ACCOUNT);
+
+      // give rescan first address.
+      await rescan.wdb.rescan(0);
+
+      const rescanBalance = await getBalance(rescan.client, ACCOUNT);
+      assert.deepStrictEqual(rescanBalance, expectedBalance);
+
+      const rescanInfo = await rescan.client.getAccount(ACCOUNT);
+      assert.deepStrictEqual(rescanInfo, expectedInfo);
+    });
+
+    it('should send gapped txs in the same block', async () => {
+      const expectedRescanBalance = await getBalance(rescan.client, ACCOUNT);
+      const txCount = 5;
+
+      const all = await generateGappedAddresses(main.client, txCount + 1, regtest);
+      await deriveAddresses(main.client, all[all.length - 1].depth);
+      const addresses = all.slice(1);
+
+      // give addBlock first address.
+      await deriveAddresses(addBlock.client, addresses[0].depth - TEST_LOOKAHEAD);
+
+      const mainWalletBlocks = forEvent(main.wdb, 'block connect');
+      const addBlockWalletBlocks = forEvent(addBlock.wdb, 'block connect');
+      const rescanWalletBlocks = forEvent(rescan.wdb, 'block connect');
+
+      for (const {address} of addresses) {
+        await minerWallet.send({
+          outputs: [{
+            address: address.toString(regtest),
+            value: 1e6
+          }]
+        });
+      }
+
+      await nodes.generate(MAIN, 1, minerAddress);
+
+      await Promise.all([
+        mainWalletBlocks,
+        addBlockWalletBlocks,
+        rescanWalletBlocks
+      ]);
+
+      const rescanBalance = await getBalance(rescan.client, ACCOUNT);
+      assert.deepStrictEqual(rescanBalance, expectedRescanBalance);
+
+      await deriveAddresses(rescan.client, addresses[0].depth - TEST_LOOKAHEAD);
+    });
+
+    it.skip('should receive gapped txs in the same block (addBlock)', async () => {
+      const expectedBalance = await getBalance(main.client, ACCOUNT);
+      const addBlockBalance = await getBalance(addBlock.client, ACCOUNT);
+      assert.deepStrictEqual(addBlockBalance, expectedBalance);
+
+      const mainInfo = await main.client.getAccount(ACCOUNT);
+      const addBlockInfo = await addBlock.client.getAccount(ACCOUNT);
+      assert.deepStrictEqual(addBlockInfo, mainInfo);
+    });
+
+    it('should receive gapped txs in the same block (rescan)', async () => {
+      const expectedBalance = await getBalance(main.client, ACCOUNT);
+      const expectedInfo = await main.client.getAccount(ACCOUNT);
+
+      await rescan.wdb.rescan(0);
+
+      const rescanBalance = await getBalance(rescan.client, ACCOUNT);
+      assert.deepStrictEqual(rescanBalance, expectedBalance);
+
+      const rescanInfo = await rescan.client.getAccount(ACCOUNT);
+      assert.deepStrictEqual(rescanInfo, expectedInfo);
+    });
+
+    it('should send gapped outputs in the same tx', async () => {
+      const expectedRescanBalance = await getBalance(rescan.client, ACCOUNT);
+      const outCount = 5;
+
+      const all = await generateGappedAddresses(main.client, outCount + 1, regtest);
+      await deriveAddresses(main.client, all[all.length - 1].depth);
+      const addresses = all.slice(1);
+
+      // give addBlock first address.
+      await deriveAddresses(addBlock.client, addresses[0].depth - TEST_LOOKAHEAD);
+
+      const mainWalletBlocks = forEvent(main.wdb, 'block connect');
+      const addBlockWalletBlocks = forEvent(addBlock.wdb, 'block connect');
+      const rescanWalletBlocks = forEvent(rescan.wdb, 'block connect');
+
+      const outputs = addresses.map(({address}) => ({
+        address: address.toString(regtest),
+        value: 1e6
+      }));
+
+      await minerWallet.send({outputs});
+      await nodes.generate(MAIN, 1, minerAddress);
+
+      await Promise.all([
+        mainWalletBlocks,
+        addBlockWalletBlocks,
+        rescanWalletBlocks
+      ]);
+
+      const rescanBalance = await getBalance(rescan.client, ACCOUNT);
+      assert.deepStrictEqual(rescanBalance, expectedRescanBalance);
+
+      await deriveAddresses(rescan.client, addresses[0].depth - TEST_LOOKAHEAD);
+    });
+
+    it.skip('should receive gapped outputs in the same tx (addBlock)', async () => {
+      const expectedBalance = await getBalance(main.client, ACCOUNT);
+      const addBlockBalance = await getBalance(addBlock.client, ACCOUNT);
+      assert.deepStrictEqual(addBlockBalance, expectedBalance);
+
+      const mainInfo = await main.client.getAccount(ACCOUNT);
+      const addBlockInfo = await addBlock.client.getAccount(ACCOUNT);
+      assert.deepStrictEqual(addBlockInfo, mainInfo);
+    });
+
+    it('should receive gapped outputs in the same tx (rescan)', async () => {
+      const expectedBalance = await getBalance(main.client, ACCOUNT);
+      const expectedInfo = await main.client.getAccount(ACCOUNT);
+
+      await rescan.wdb.rescan(0);
+
+      const rescanBalance = await getBalance(rescan.client, ACCOUNT);
+      assert.deepStrictEqual(rescanBalance, expectedBalance);
+
+      const rescanInfo = await rescan.client.getAccount(ACCOUNT);
+      assert.deepStrictEqual(rescanInfo, expectedInfo);
+    });
+  });
+  }
+
+  for (const {SPV, STANDALONE, name} of combinations) {
+  describe(`Initial sync/rescan (${name} Integration)`, function() {
+    // Test wallet plugin/standalone is disabled and re-enabled after some time:
+    //   1. Normal received blocks.
+    //   2. Reorged after wallet was closed.
+    // NOTE: Node is not closed, only wallet.
+
+    const MINER = 0;
+    const WALLET = 1;
+    const WALLET_NO_WALLET = 2;
+
+    /** @type {NodesContext} */
+    let nodes;
+    let wnodeCtx, noWnodeCtx;
+    let minerWallet, minerAddress;
+    let testWallet, testAddress;
 
     before(async () => {
-      await node.open();
-      bob = await wdb.create();
-      bobAddr = await bob.receiveAddress();
+      nodes = new NodesContext(regtest, 1);
+
+      // MINER = 0
+      nodes.init({
+        wallet: true,
+        noDNS: true,
+        bip37: true
+      });
+
+      // WALLET = 1
+      wnodeCtx = nodes.addNode({
+        noDNS: true,
+        wallet: true,
+
+        standalone: STANDALONE,
+        spv: SPV,
+
+        // We need to store on disk in order to test
+        // recovery on restart
+        memory: false
+      });
+
+      // WALLET_NO_WALLET = 2
+      // Wallet node that uses same chain above one
+      // just does not start wallet.
+      noWnodeCtx = nodes.addNode({
+        noDNS: true,
+        wallet: false,
+        prefix: wnodeCtx.prefix,
+        memory: false,
+        spv: SPV
+      });
+
+      // only open two at a time.
+      await nodes.open(MINER);
+      await nodes.open(WALLET);
+
+      minerWallet = nodes.context(MINER).wclient.wallet('primary');
+      minerAddress = (await minerWallet.createAddress('default')).address;
+
+      testWallet = wnodeCtx.wclient.wallet('primary');
+      testAddress = (await testWallet.createAddress('default')).address;
+
+      await nodes.close(WALLET);
     });
 
     after(async () => {
-      await node.close();
+      await nodes.close();
+      await nodes.destroy();
     });
 
-    it('should fund wallets', async () => {
-      const blocks = 10;
-      await mineBlocks(blocks, aliceAddr);
-      await mineBlocks(blocks, bobAddr);
-
-      const bobBal  = await bob.getBalance();
-      assert.strictEqual(bobBal.confirmed, blocks * 2000 * 1e6);
-      assert.strictEqual(alice.balance, blocks * 2000 * 1e6);
+    afterEach(async () => {
+      await nodes.close(WALLET);
+      await nodes.close(WALLET_NO_WALLET);
     });
 
-    it('should run auction', async () => {
-      // Alice opens
-      await sendTXs();
-      const aliceOpen = await alice.createOpen(NAME);
-      await node.mempool.addTX(aliceOpen.toTX());
-      const openBlocks = await mineBlocks(1);
-      // Coinbase plus open
-      assert.strictEqual(openBlocks[0].txs.length, 4);
+    it('should fund and spend to wallet', async () => {
+      await wnodeCtx.open();
 
-      // Advance to bidding phase
-      await mineBlocks(treeInterval);
-      await forValue(alice, 'height', node.chain.height);
+      const txEvent = forEvent(wnodeCtx.wdb, 'tx');
 
-      // Poor Bob, all he does is send one (losing) bid but his wallet will
-      // watch all the other activity including TRANSFERS for this name
-      await bob.sendBid(NAME, 10000, 10000);
+      // fund wallet.
+      await nodes.generate(MINER, 9, minerAddress);
 
-      // Alice sends winning bid
-      await sendTXs();
-      const aliceBid = await alice.createBid(NAME, 20000, 20000);
-      await node.mempool.addTX(aliceBid.toTX());
-      const bidBlocks = await mineBlocks(1);
-      assert.strictEqual(bidBlocks[0].txs.length, 5);
+      // Send TX to the test wallet.
+      await minerWallet.send({
+        outputs: [{
+          address: testAddress,
+          value: 1e6
+        }]
+      });
 
-      bidBlockHash = bidBlocks[0].hash();
+      await nodes.generate(MINER, 1, minerAddress);
+      await txEvent;
 
-      // Advance to reveal phase
-      await mineBlocks(biddingPeriod);
-      await bob.sendReveal(NAME);
-      await sendTXs();
-      const aliceReveal = await alice.createReveal(NAME);
-      await node.mempool.addTX(aliceReveal.toTX());
-      const revealBlocks = await mineBlocks(1);
-      assert.strictEqual(revealBlocks[0].txs.length, 5);
-
-      // Close auction
-      await mineBlocks(revealPeriod);
-
-      // Alice registers
-      await sendTXs();
-      const aliceRegister = await alice.createRegister(
-        NAME,
-        Resource.fromJSON({records:[]})
-      );
-      await node.mempool.addTX(aliceRegister.toTX());
-
-      const registerBlocks = await mineBlocks(1);
-      assert.strictEqual(registerBlocks[0].txs.length, 4);
+      const balance = await getWClientBalance(wnodeCtx.wclient, 'primary', 'default');
+      assert.deepStrictEqual(balance, new Balance({
+        coin: 1,
+        tx: 1,
+        confirmed: 1e6,
+        unconfirmed: 1e6
+      }));
     });
 
-    it('should get namestate', async () => {
-      const ns = await bob.getNameStateByName(NAME);
-      // Bob has the namestate
-      assert(ns);
+    it('should rescan/resync after wallet was off', async () => {
+      // replace wallet node with new one w/o wallet.
+      await noWnodeCtx.open();
 
-      // Bob is not the name owner
-      const {hash, index} = ns.owner;
-      const coin = await bob.getCoin(hash, index);
-      assert.strictEqual(coin, null);
+      await nodes.generate(MINER, 10, minerAddress);
 
-      // Name is not in mid-TRANSFER
-      assert.strictEqual(ns.transfer, 0);
+      // Mine in the last block that we will be reorging.
+      await minerWallet.send({
+        outputs: [{
+          address: testAddress,
+          value: 2e6
+        }]
+      });
+
+      const waitHeight = nodes.height(MINER) + 1;
+      const nodeSync = forEventCondition(noWnodeCtx.node, 'connect', (entry) => {
+        return entry.height === waitHeight;
+      });
+
+      await nodes.generate(MINER, 1, minerAddress);
+      await nodeSync;
+
+      // Disable wallet
+      await noWnodeCtx.close();
+
+      wnodeCtx.init();
+
+      const eventsToWait = [];
+      // For spv we don't wait for sync done, as it will do the full rescan
+      // and reset the SPVNode as well. It does not depend on the accumulated
+      // blocks.
+      if (SPV) {
+        // This will happen right away, as scan will just call reset
+        eventsToWait.push(forEvent(wnodeCtx.wdb, 'sync done'));
+        // This is what matters for the rescan.
+        eventsToWait.push(forEventCondition(wnodeCtx.wdb, 'block connect', (entry) => {
+          return entry.height === nodes.height(MINER);
+        }));
+          // Make sure node gets resets.
+        eventsToWait.push(forEvent(wnodeCtx.node, 'reset'));
+      } else {
+        eventsToWait.push(forEvent(wnodeCtx.wdb, 'sync done'));
+      }
+
+      await wnodeCtx.open();
+      await Promise.all(eventsToWait);
+      assert.strictEqual(wnodeCtx.wdb.height, nodes.height(MINER));
+
+      const balance = await getWClientBalance(wnodeCtx.wclient, 'primary', 'default');
+      assert.deepStrictEqual(balance, new Balance({
+        coin: 2,
+        tx: 2,
+        confirmed: 1e6 + 2e6,
+        unconfirmed: 1e6 + 2e6
+      }));
+
+      await wnodeCtx.close();
     });
 
-    it('should process TRANSFER', async () => {
-      // Alice transfers the name to her own address
-      await sendTXs();
-      const aliceTransfer = await alice.createTransfer(NAME, aliceAddr);
-      await node.mempool.addTX(aliceTransfer.toTX());
-      const transferBlocks = await mineBlocks(1);
-      assert.strictEqual(transferBlocks[0].txs.length, 4);
+    it('should rescan/resync after wallet was off and node reorged', async () => {
+      const minerCtx = nodes.context(MINER);
 
-      // Bob detects the TRANSFER even though it doesn't involve him at all
-      const ns = await bob.getNameStateByName(NAME);
-      assert(ns);
-      assert.strictEqual(ns.transfer, node.chain.height);
+      await noWnodeCtx.open();
 
-      // Bob's wallet has indexed the TRANSFER
-      const bobTransfer = await bob.getTX(aliceTransfer.hash());
-      assert.strictEqual(bobTransfer, null);
+      // Reorg the network
+      const tip = minerCtx.chain.tip;
+      const block = await minerCtx.chain.getBlock(tip.hash);
+
+      // Last block contained our tx from previous test. (integration)
+      assert.strictEqual(block.txs.length, 2);
+
+      const reorgEvent = forEvent(minerCtx.node, 'reorganize');
+      const forkTip = await minerCtx.chain.getPrevious(tip);
+
+      // REORG
+      await nodes.generate(MINER, 2, minerAddress, forkTip);
+      // Reset mempool/Get rid of tx after reorg.
+      await nodes.context(MINER).mempool.reset();
+      await nodes.generate(MINER, 2, minerAddress);
+      await reorgEvent;
+
+      // Send another tx, with different output.
+      await minerWallet.send({
+        outputs: [{
+          address: testAddress,
+          value: 3e6
+        }]
+      });
+
+      const waitHeight = nodes.height(MINER) + 1;
+      const nodeSync = forEventCondition(noWnodeCtx.node, 'connect', (entry) => {
+        return entry.height === waitHeight;
+      });
+
+      await nodes.generate(MINER, 1, minerAddress);
+      await nodeSync;
+
+      await noWnodeCtx.close();
+
+      wnodeCtx.init();
+
+      // initial sync
+      const eventsToWait = [];
+
+      if (SPV) {
+        // This will happen right away, as scan will just call reset
+        eventsToWait.push(forEvent(wnodeCtx.wdb, 'sync done'));
+
+        // This is what matters for the rescan.
+        eventsToWait.push(forEventCondition(wnodeCtx.wdb, 'block connect', (entry) => {
+          return entry.height === nodes.height(MINER);
+        }));
+
+        // Make sure node gets resets.
+        eventsToWait.push(forEvent(wnodeCtx.node, 'reset'));
+        eventsToWait.push(forEvent(wnodeCtx.wdb, 'unconfirmed'));
+      } else {
+        eventsToWait.push(forEvent(wnodeCtx.wdb, 'sync done'));
+        eventsToWait.push(forEvent(wnodeCtx.wdb, 'unconfirmed'));
+      }
+      await wnodeCtx.open();
+      await Promise.all(eventsToWait);
+
+      assert.strictEqual(wnodeCtx.height, nodes.height(MINER));
+      assert.strictEqual(wnodeCtx.wdb.state.height, wnodeCtx.height);
+
+      const balance = await getWClientBalance(wnodeCtx.wclient, 'primary', 'default');
+
+      // previous transaction should get unconfirmed.
+      assert.deepStrictEqual(balance, new Balance({
+        coin: 3,
+        tx: 3,
+        confirmed: 1e6 + 3e6,
+        unconfirmed: 1e6 + 2e6 + 3e6
+      }));
+
+      await wnodeCtx.close();
     });
 
-    it('should fully rescan', async () => {
-      await wdb.rescan(0);
-      await forValue(wdb, 'height', node.chain.height);
+    it('should rescan/resync after wallet was off and received gapped txs in the same block', async () => {
+      if (SPV)
+        this.skip();
 
-      // No change
-      const ns = await bob.getNameStateByName(NAME);
-      assert(ns);
-      assert.strictEqual(ns.transfer, node.chain.height);
+      const txCount = 5;
+      await wnodeCtx.open();
+      const startingBalance = await getBalance(testWallet, 'default');
+      const all = await generateGappedAddresses(testWallet, txCount, regtest);
+      await wnodeCtx.close();
+
+      await noWnodeCtx.open();
+
+      for (const {address} of all) {
+        await minerWallet.send({
+          outputs: [{
+            address: address.toString(regtest),
+            value: 1e6
+          }]
+        });
+      }
+
+      const waitHeight = nodes.height(MINER) + 1;
+      const nodeSync = forEventCondition(noWnodeCtx.node, 'connect', (entry) => {
+        return entry.height === waitHeight;
+      });
+
+      await nodes.generate(MINER, 1, minerAddress);
+
+      await nodeSync;
+      await noWnodeCtx.close();
+
+      wnodeCtx.init();
+
+      const syncDone = forEvent(wnodeCtx.wdb, 'sync done');
+      await wnodeCtx.open();
+      await syncDone;
+      assert.strictEqual(wnodeCtx.wdb.height, nodes.height(MINER));
+
+      const balance = await getBalance(testWallet, 'default');
+      const diff = balance.diff(startingBalance);
+      assert.deepStrictEqual(diff, new Balance({
+        tx: txCount,
+        coin: txCount,
+        confirmed: 1e6 * txCount,
+        unconfirmed: 1e6 * txCount
+      }));
+
+      await wnodeCtx.close();
     });
 
-    it('should rescan since, but not including, the BIDs', async () => {
-      const bidBlock = await node.chain.getEntry(bidBlockHash);
-      await wdb.rescan(bidBlock.height);
-      await forValue(wdb, 'height', node.chain.height);
+    it('should rescan/resync after wallet was off and received gapped coins in the same tx', async () => {
+      if (SPV)
+        this.skip();
 
-      // No change
-      const ns = await bob.getNameStateByName(NAME);
-      assert(ns);
-      assert.strictEqual(ns.transfer, node.chain.height);
-    });
+      const outCount = 5;
+      await wnodeCtx.open();
+      const startingBalance = await getBalance(testWallet, 'default');
+      const all = await generateGappedAddresses(testWallet, outCount, regtest);
+      await wnodeCtx.close();
 
-    it('should process FINALIZE', async () => {
-      await mineBlocks(transferLockup);
+      await noWnodeCtx.open();
 
-      // Alice finalizes the name
-      await sendTXs();
-      const aliceFinalize = await alice.createFinalize(NAME);
-      await node.mempool.addTX(aliceFinalize.toTX());
-      const finalizeBlocks = await mineBlocks(1);
-      assert.strictEqual(finalizeBlocks[0].txs.length, 4);
+      const outputs = all.map(({address}) => ({
+        address: address.toString(regtest),
+        value: 1e6
+      }));
 
-      aliceFinalizeHash = aliceFinalize.hash();
+      await minerWallet.send({outputs});
 
-      // Bob detects the FINALIZE even though it doesn't involve him at all
-      const ns = await bob.getNameStateByName(NAME);
-      assert(ns);
-      assert.bufferEqual(ns.owner.hash, aliceFinalizeHash);
+      const waitHeight = nodes.height(MINER) + 1;
+      const nodeSync = forEventCondition(noWnodeCtx.node, 'connect', (entry) => {
+        return entry.height === waitHeight;
+      });
 
-      // Bob's wallet has not indexed the FINALIZE
-      const bobFinalize = await bob.getTX(aliceFinalize.hash());
-      assert.strictEqual(bobFinalize, null);
-    });
+      await nodes.generate(MINER, 1, minerAddress);
 
-    it('should fully rescan', async () => {
-      await wdb.rescan(0);
-      await forValue(wdb, 'height', node.chain.height);
+      await nodeSync;
+      await noWnodeCtx.close();
 
-      // No change
-      const ns = await bob.getNameStateByName(NAME);
-      assert(ns);
-      assert.bufferEqual(ns.owner.hash, aliceFinalizeHash);
-    });
+      wnodeCtx.init();
 
-    it('should rescan since, but not including, the BIDs', async () => {
-      const bidBlock = await node.chain.getEntry(bidBlockHash);
-      await wdb.rescan(bidBlock.height);
-      await forValue(wdb, 'height', node.chain.height);
+      const syncDone = forEvent(wnodeCtx.wdb, 'sync done');
+      await wnodeCtx.open();
+      await syncDone;
+      assert.strictEqual(wnodeCtx.wdb.height, nodes.height(MINER));
 
-      // No change
-      const ns = await bob.getNameStateByName(NAME);
-      assert(ns);
-      assert.bufferEqual(ns.owner.hash, aliceFinalizeHash);
-    });
+      const balance = await getBalance(testWallet, 'default');
+      const diff = balance.diff(startingBalance);
+      assert.deepStrictEqual(diff, new Balance({
+        tx: 1,
+        coin: outCount,
+        confirmed: 1e6 * outCount,
+        unconfirmed: 1e6 * outCount
+      }));
 
-    it('should process TRANSFER (again)', async () => {
-      // Alice transfers the name to her own address
-      await sendTXs();
-      const aliceTransfer = await alice.createTransfer(NAME, aliceAddr);
-      await node.mempool.addTX(aliceTransfer.toTX());
-      const transferBlocks = await mineBlocks(1);
-      assert.strictEqual(transferBlocks[0].txs.length, 4);
-
-      // Bob detects the TRANSFER even though it doesn't involve him at all
-      const ns = await bob.getNameStateByName(NAME);
-      assert(ns);
-      assert.strictEqual(ns.transfer, node.chain.height);
-
-      // Bob's wallet has not indexed the TRANSFER
-      const bobTransfer = await bob.getTX(aliceTransfer.hash());
-      assert.strictEqual(bobTransfer, null);
-    });
-
-    it('should process REVOKE', async () => {
-      // Alice revokes the name
-      await sendTXs();
-      const aliceRevoke = await alice.createRevoke(NAME);
-      await node.mempool.addTX(aliceRevoke.toTX());
-      const revokeBlocks = await mineBlocks(1);
-      assert.strictEqual(revokeBlocks[0].txs.length, 4);
-
-      // Bob detects the REVOKE even though it doesn't involve him at all
-      const ns = await bob.getNameStateByName(NAME);
-      assert(ns);
-      assert.strictEqual(ns.revoked, node.chain.height);
-
-      // Bob's wallet has not indexed the REVOKE
-      const bobTransfer = await bob.getTX(aliceRevoke.hash());
-      assert.strictEqual(bobTransfer, null);
-    });
-
-    it('should fully rescan', async () => {
-      await wdb.rescan(0);
-      await forValue(wdb, 'height', node.chain.height);
-
-      // No change
-      const ns = await bob.getNameStateByName(NAME);
-      assert(ns);
-      assert.strictEqual(ns.revoked, node.chain.height);
-    });
-
-    it('should rescan since, but not including, the BIDs', async () => {
-      const bidBlock = await node.chain.getEntry(bidBlockHash);
-      await wdb.rescan(bidBlock.height);
-      await forValue(wdb, 'height', node.chain.height);
-
-      // No change
-      const ns = await bob.getNameStateByName(NAME);
-      assert(ns);
-      assert.strictEqual(ns.revoked, node.chain.height);
+      await wnodeCtx.close();
     });
   });
+  }
+
+  for (const {STANDALONE, name} of noSPVcombinations) {
+  describe(`Deadlock (${name} Integration)`, function() {
+    this.timeout(10000);
+    const nodes = new NodesContext(regtest, 1);
+    let minerCtx;
+    let nodeCtx, address, node, wdb;
+
+    before(async () => {
+      nodes.init({
+        memory: false,
+        wallet: false
+      });
+
+      nodes.addNode({
+        memory: false,
+        wallet: true,
+        standalone: STANDALONE
+      });
+
+      await nodes.open();
+
+      minerCtx = nodes.context(0);
+      nodeCtx = nodes.context(1);
+      node = nodeCtx.node;
+      wdb = nodeCtx.wdb;
+
+      address = await wdb.primary.receiveAddress();
+    });
+
+    after(async () => {
+      await nodes.close();
+    });
+
+    it('should generate 20 blocks', async () => {
+      const BLOCKS = 20;
+      const chainBlocks = forEventCondition(node.chain, 'connect', (entry) => {
+        return entry.height === BLOCKS;
+      }, 5000);
+
+      const wdbBlocks = forEventCondition(wdb, 'block connect', (entry) => {
+        return entry.height === BLOCKS;
+      }, 5000);
+
+      await minerCtx.mineBlocks(BLOCKS, address);
+      await Promise.all([
+        chainBlocks,
+        wdbBlocks
+      ]);
+    });
+
+    it('should rescan when receiving a block', async () => {
+      const preTip = await wdb.getTip();
+      const blocks = forEventCondition(node.chain, 'connect', (entry) => {
+        return entry.height === preTip.height + 5;
+      });
+      const wdbBlocks = forEventCondition(wdb, 'block connect', (entry) => {
+        return entry.height === preTip.height + 5;
+      });
+
+      await Promise.all([
+        minerCtx.mineBlocks(5, address),
+        wdb.rescan(0)
+      ]);
+
+      await blocks;
+      await wdbBlocks;
+
+      const wdbTip = await wdb.getTip();
+      assert.strictEqual(wdbTip.height, preTip.height + 5);
+    });
+
+    it('should rescan when receiving blocks', async () => {
+      const preTip = await wdb.getTip();
+      const minerHeight = minerCtx.height;
+      const BLOCKS = 50;
+
+      const blocks = forEventCondition(node.chain, 'connect', (entry) => {
+        return entry.height === minerHeight + BLOCKS;
+      });
+
+      const wdbBlocks = forEventCondition(wdb, 'block connect', (entry) => {
+        return entry.height === minerHeight + BLOCKS;
+      });
+
+      const promises = [
+        minerCtx.mineBlocks(BLOCKS, address)
+      ];
+
+      await forEvent(node.chain, 'connect');
+      promises.push(wdb.rescan(0));
+      await Promise.all(promises);
+
+      await blocks;
+      await wdbBlocks;
+
+      const tip = await wdb.getTip();
+
+      assert.strictEqual(tip.height, preTip.height + BLOCKS);
+    });
+
+    it('should rescan when chain is reorging', async () => {
+      const minerHeight = minerCtx.height;
+      const BLOCKS = 50;
+      const reorgHeight = minerHeight - 10;
+      const newHeight = minerHeight + 40;
+
+      const blocks = forEventCondition(node.chain, 'connect', (entry) => {
+        return entry.height === newHeight;
+      }, 10000);
+
+      const walletBlocks = forEventCondition(wdb, 'block connect', (entry) => {
+        return entry.height === newHeight;
+      }, 10000);
+
+      const reorgEntry = await minerCtx.chain.getEntry(reorgHeight);
+
+      const promises = [
+        minerCtx.mineBlocks(BLOCKS, address, reorgEntry)
+      ];
+
+      // We start rescan only after first disconnect is detected to ensure
+      // wallet guard is set.
+      await forEvent(node.chain, 'disconnect');
+      promises.push(wdb.rescan(0));
+      await Promise.all(promises);
+
+      await blocks;
+      await walletBlocks;
+
+      const tip = await wdb.getTip();
+      assert.strictEqual(tip.height, newHeight);
+    });
+
+    // Rescanning alternate chain.
+    it('should rescan when chain is reorging (alternate chain)', async () => {
+      const minerHeight = minerCtx.height;
+      const BLOCKS = 50;
+      const reorgHeight = minerHeight - 20;
+
+      const reorgEntry = await minerCtx.chain.getEntry(reorgHeight);
+      const mineBlocks = minerCtx.mineBlocks(BLOCKS, address, reorgEntry);
+
+      // We start rescan only after first disconnect is detected to ensure
+      // wallet guard is set.
+      await forEvent(node.chain, 'disconnect');
+
+      // abort should also report reason as an error.
+      const errorEvents = forEvent(wdb, 'error', 1);
+
+      let err;
+      try {
+        // Because we are rescanning within the rescan blocks,
+        // these blocks will end up in alternate chain, resulting
+        // in error.
+        await wdb.rescan(minerHeight - 5);
+      } catch (e) {
+        err = e;
+      }
+
+      assert(err);
+      assert.strictEqual(err.message, 'Cannot rescan an alternate chain.');
+
+      const errors = await errorEvents;
+      assert.strictEqual(errors.length, 1);
+      const errEv = errors[0].values[0];
+      assert(errEv);
+      assert.strictEqual(errEv.message, 'Cannot rescan an alternate chain.');
+
+      await mineBlocks;
+    });
+  });
+  }
 });
+
+async function deriveAddresses(walletClient, depth) {
+  const accInfo = await walletClient.getAccount('default');
+  let currentDepth = accInfo.receiveDepth;
+
+  if (depth <= currentDepth)
+    return;
+
+  while (currentDepth !== depth) {
+    const addr = await walletClient.createAddress('default');
+    currentDepth = addr.index;
+  }
+}
+
+async function getAddress(walletClient, depth = -1, network = regtest) {
+  const accInfo = await walletClient.getAccount('default');
+  const {accountKey, lookahead} = accInfo;
+
+  if (depth === -1)
+    depth = accInfo.receiveDepth;
+
+  const XPUBKey = HDPublicKey.fromBase58(accountKey, network);
+  const key = XPUBKey.derive(0).derive(depth).publicKey;
+  const address = Address.fromPubkey(key);
+
+  const gappedDepth = depth + lookahead + 1;
+  return {address, depth, gappedDepth};
+}
+
+async function generateGappedAddresses(walletClient, count, network = regtest) {
+  let depth = -1;
+
+  const addresses = [];
+
+  // generate gapped addresses.
+  for (let i = 0; i < count; i++) {
+    const addrInfo = await getAddress(walletClient, depth, network);
+
+    addresses.push({
+      address: addrInfo.address,
+      depth: addrInfo.depth,
+      gappedDepth: addrInfo.gappedDepth
+    });
+
+    depth = addrInfo.gappedDepth;
+  }
+
+  return addresses;
+}

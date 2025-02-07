@@ -3,99 +3,14 @@
 [![Build Status][ci-status-img]][ci-status-url]
 [![Coverage Status][coverage-status-img]][coverage-status-url]
 
-__HSD__ is an implementation of the [Handshake][handshake] Protocol.
+**HSD** is an implementation of the [Handshake][handshake] Protocol.
 
-## Install
+## Documentation
 
-`hsd` requires Node.js v12 or higher
-
-
-### Building From Source
-
-```
-$ git clone https://github.com/handshake-org/hsd.git
-$ cd hsd
-$ npm install --production
-$ ./bin/hsd
-```
-
-Note that `node-gyp` must be installed. See the
-[node-gyp](https://github.com/nodejs/node-gyp) documentation for more
-information.
-
-### Docker
-#### Building an image
-
-To build a Docker image with the name `hsd:<version>-<commit>`, run:
-
-```bash
-$ VERSION=$(cat package.json | grep version | sed 's/.*"\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/')
-$ COMMIT=$(git rev-parse --short HEAD)
-$ docker build -t hsd:$VERSION-$COMMIT .
-```
-
-#### Running a container
-
-To start a container named `hsd` on a `regtest` network with an exposed
-node API server, run:
-
-```bash
-$ docker run --name hsd -p 14037:14037 hsd:$VERSION-$COMMIT \
-    --network regtest \
-    --http-host 0.0.0.0 \
-    --api-key=foo
-```
-
-To test connectivity, curl the info endpoint:
-```bash
-$ curl http://x:foo@localhost:14037/
-```
-
->Note: by default, none of the container's ports are exposed. Depending
-on the network used for your node, you will need to expose the correct ports
-for the node's various services (node http api, wallet http api, recursive
-name server, authoritative name server, p2p protocol, encrypted p2p protocol).
-The default ports can be found [here](./lib/protocol/networks.js). The DNS
-servers must also expose a UDP port. The syntax is different from TCP and can
-be found [here](https://docs.docker.com/config/containers/container-networking/#published-ports).
-
-#### Stopping a container
-
-To stop a container named `hsd`, run:
-
-```bash
-$ docker stop hsd
-```
-
-### npm
-
-It is not recommended to install `hsd` from npm's repositories
-but it is still possible to install with `npm` using a remote
-`git` repository.
-
-```
-$ npm install -g https://github.com/handshake-org/hsd.git
-```
-
-A `git` ref can be used to install a particular version by appending
-a `#` and the name of the `git` ref to the URL. For example,
-`https://github.com/handshake-org/hsd.git#v3.0.1`. It is recommended
-to use the [latest tagged release](https://github.com/handshake-org/hsd/releases).
-
-If adding `hsd` as a dependency to a project, use the command:
-
-```
-$ npm install https://github.com/handshake-org/hsd.git
-```
-
-### macOS
-
-`hsd` is available via [Homebrew](https://brew.sh). This will
-install all required dependencies as well as `unbound`.
-
-```
-$ brew install hsd
-```
+- [Install guide](./docs/install.md)
+- Documentation Site: [https://hsd-dev.org](https://hsd-dev.org)
+- API Docs: [https://hsd-dev.org/api-docs](https://hsd-dev.org/api-docs)
+- JSDoc: [https://hsd-dev.org/hsd](https://hsd-dev.org/hsd)
 
 ## CLI
 
@@ -116,12 +31,6 @@ The shortcuts `hsd-rpc` and `hsw-rpc` are available if you install hs-client glo
 ```
 $ npm install -g hs-client
 ```
-
-## Documentation
-
-- Documentation Site: [https://hsd-dev.org](https://hsd-dev.org)
-- API Docs: [https://hsd-dev.org/api-docs](https://hsd-dev.org/api-docs)
-- JSDoc: [https://hsd-dev.org/hsd](https://hsd-dev.org/hsd)
 
 ## Contributing
 
@@ -152,7 +61,7 @@ installed on your system _before_ installing `hsd`.
 By default HSD will listen on an authoritative and recursive nameserver (ports
 `5349` and `5350` respectively). To configure this:
 
-``` bash
+```bash
 # Have the authoritative server listen on port 5300.
 $ hsd --ns-port 5300
 
@@ -162,7 +71,7 @@ $ hsd --rs-host 0.0.0.0 --rs-port 53 # Warning: public!
 
 Your localhost should now be diggable:
 
-``` bash
+```bash
 $ dig @127.0.0.1 www.ietf.org +dnssec
 $ dig @127.0.0.1 -p 5300 org +dnssec
 ```
@@ -187,7 +96,7 @@ $ hsd --listen --public-host [my-public-ip-address] --max-inbound 50
 
 To mine with a CPU, HSD should be used in combination with [hs-client].
 
-``` bash
+```bash
 # To boot and listen publicly on the HTTP server...
 # Optionally pass in a custom coinbase address.
 $ hsd --http-host '::' --api-key 'hunter2' \
@@ -197,7 +106,7 @@ $ hsd --http-host '::' --api-key 'hunter2' \
 Once HSD is running, we can use [hs-client] to activate the miner
 using the `setgenerate` RPC.
 
-``` bash
+```bash
 $ hsd-rpc --http-host 'my-ip-address' \
   --api-key 'hunter2' setgenerate true 1
 ```
@@ -211,7 +120,7 @@ developers. See [hs-airdrop][airdrop] for instructions on how to redeem coins.
 
 First we should look at the current status of a name we want.
 
-``` bash
+```bash
 $ hsd-rpc getnameinfo handshake
 ```
 
@@ -220,7 +129,7 @@ necessary to start the bidding process. After an open transaction is mined,
 there is a short delay before bidding begins. This delay is necessary to ensure
 the auction's state is inserted into the [urkel] tree.
 
-``` bash
+```bash
 # Attempt to open bidding for `handshake`.
 $ hsw-rpc sendopen handshake
 ```
@@ -229,7 +138,7 @@ Using `getnameinfo` we can check to see when bidding will begin. Once the
 auction enters the bidding state, we can send a bid, with a lockup-value to
 conceal our true bid.
 
-``` bash
+```bash
 # Send a bid of 5 coins, with a lockup value of 10 coins.
 # These units are in HNS (1 HNS = 1,000,000 dollarydoos).
 $ hsw-rpc sendbid handshake 5 10
@@ -238,7 +147,7 @@ $ hsw-rpc sendbid handshake 5 10
 After the appropriate amount of time has passed, (1 day in the case of
 testnet), we should reveal our bid.
 
-``` bash
+```bash
 # Reveal our bid for `handshake`.
 $ hsw-rpc sendreveal handshake
 ```
@@ -246,7 +155,7 @@ $ hsw-rpc sendreveal handshake
 We can continue monitoring the status, now with the wallet's version of
 getnameinfo:
 
-``` bash
+```bash
 $ hsw-rpc getnameinfo handshake
 # To see other bids and reveals
 $ hsw-rpc getauctioninfo handshake
@@ -257,7 +166,7 @@ If we end up losing, we can redeem our money from the covenant with
 
 If we won, we can now register and update the name using `sendupdate`.
 
-``` bash
+```bash
 $ hsw-rpc sendupdate handshake \
   '{"records":[{"type":"GLUE4","ns":"ns1.example.com.","address":"127.0.0.1"}]}'
 ```
@@ -266,7 +175,7 @@ Note that the `ns` field's `domain@ip` format symbolizes glue.
 
 Expiration on testnet is around 30 days, so be sure to send a renewal soon!
 
-``` bash
+```bash
 $ hsw-rpc sendrenewal handshake
 ```
 
@@ -303,7 +212,7 @@ accomplishing this:
 First, we need to create a TXT record which we will sign in our zone (say we
 own example.com for instance):
 
-``` bash
+```bash
 $ hsw-rpc createclaim example
 {
   "name": "example",
@@ -321,7 +230,7 @@ address we want the name to be associated with, along with a fee that we're
 willing to pay the miner to mine our claim. This TXT record must be added to
 our name's zone file and signed:
 
-``` zone
+```zone
 ...
 example.com. 1800 IN TXT "hns-testnet:aakbvmygsp7rrhmsauhwlnwx6srd5m2v4m3p3eidadl5yn2f"
 example.com. 1800 IN RRSIG TXT 5 2 1800 20190615140933 20180615131108 ...
@@ -344,7 +253,7 @@ TXT record ([example here][proof]).
 Once our proof is published on the DNS layer, we can use `sendclaim` to crawl
 the relevant zones and create the proof.
 
-``` bash
+```bash
 $ hsw-rpc sendclaim example
 ```
 
@@ -356,7 +265,7 @@ Once the transaction is mined, you must wait about 30 days (4,320 blocks) before
 Once the claim has reached maturity, you are able to bypass the auction process
 by calling `sendupdate` on your claimed name.
 
-``` bash
+```bash
 $ hsw-rpc sendupdate example \
   '{"ttl":3600,"canonical":"icanhazip.com."}'
 ```
@@ -371,7 +280,7 @@ BIND's private key format and naming convention.
 We use [bns] for this task, which includes a command-line tool for creating
 ownership proofs.
 
-``` bash
+```bash
 $ npm install bns
 $ bns-prove -b -K /path/to/keys example.com. \
   'hns-testnet:aakbvmygsp7rrhmsauhwlnwx6srd5m2v4m3p3eidadl5yn2f'
@@ -379,7 +288,7 @@ $ bns-prove -b -K /path/to/keys example.com. \
 
 The above will output a base64 string which can then be passed to the RPC:
 
-``` bash
+```bash
 $ hsd-rpc sendrawclaim 'base64-string'
 ```
 
@@ -431,4 +340,4 @@ See LICENSE for more info.
 [coverage-status-img]: https://coveralls.io/repos/github/handshake-org/hsd/badge.svg?branch=master
 [coverage-status-url]: https://coveralls.io/github/handshake-org/hsd?branch=master
 [ci-status-img]: https://github.com/handshake-org/hsd/workflows/Build/badge.svg
-[ci-status-url]: https://github.com/handshake-org/hsd/tree/master
+[ci-status-url]: https://github.com/handshake-org/hsd/actions/workflows/build.yml

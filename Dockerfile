@@ -1,12 +1,12 @@
-FROM node:14-alpine AS base
+FROM node:18-alpine AS base
 WORKDIR /opt/hsd
 RUN apk add --no-cache bash unbound-dev gmp-dev
 COPY package.json /opt/hsd
 
 # Install build dependencies and compile.
 FROM base AS build
-RUN apk add --no-cache g++ gcc make python2
-RUN npm install --production
+RUN apk add --no-cache g++ gcc make python3
+RUN npm install --omit=dev
 
 FROM base
 ENV PATH="${PATH}:/opt/hsd/bin:/opt/hsd/node_modules/.bin"

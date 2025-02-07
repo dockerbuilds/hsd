@@ -1,6 +1,3 @@
-/* eslint-env mocha */
-/* eslint prefer-arrow-callback: "off" */
-
 'use strict';
 
 const assert = require('bsert');
@@ -9,7 +6,7 @@ const FullNode = require('../lib/node/fullnode');
 const Address = require('../lib/primitives/address');
 const rules = require('../lib/covenants/rules');
 const Resource = require('../lib/dns/resource');
-const {WalletClient} = require('hs-client');
+const WalletClient = require('../lib/client/wallet');
 
 const network = Network.get('regtest');
 
@@ -30,7 +27,7 @@ const wclient = new WalletClient({
 
 const {wdb} = node.require('walletdb');
 
-const name = rules.grindName(5, 1, network);
+const name = rules.grindName(10, 1, network);
 let wallet, alice, bob, aliceReceive, bobReceive;
 
 async function mineBlocks(n, addr) {
@@ -77,7 +74,7 @@ describe('Multiple accounts participating in same auction', function() {
   });
 
   it('should open an auction and proceed to REVEAL phase', async () => {
-    await wallet.sendOpen(name, false, {account: 0});
+    await wallet.sendOpen(name, {account: 0});
     await mineBlocks(network.names.treeInterval + 2);
     let ns = await node.chain.db.getNameStateByName(name);
     assert(ns.isBidding(node.chain.height, network));
@@ -167,7 +164,7 @@ describe('Multiple accounts participating in same auction', function() {
         await wallet.sendUpdate(name, bobResource, {account: 'bob'});
       }, {
         name: 'Error',
-        message: `Account does not own: "${name}".`
+        message: `Account does not own name: ${name}.`
       });
     });
 
@@ -196,7 +193,7 @@ describe('Multiple accounts participating in same auction', function() {
         await wallet.sendRedeem(name, {account: 0});
       }, {
         name: 'Error',
-        message: 'No reveals to redeem.'
+        message: `No reveals to redeem for name: ${name}.`
       });
     });
 
@@ -230,7 +227,7 @@ describe('Multiple accounts participating in same auction', function() {
         await wallet.sendRenewal(name, {account: 'bob'});
       }, {
         name: 'Error',
-        message: `Account does not own: "${name}".`
+        message: `Account does not own name: ${name}.`
       });
     });
 
@@ -270,7 +267,7 @@ describe('Multiple accounts participating in same auction', function() {
         await wallet.sendTransfer(name, toAddr, {account: 'bob'});
       }, {
         name: 'Error',
-        message: `Account does not own: "${name}".`
+        message: `Account does not own name: ${name}.`
       });
     });
 
@@ -307,7 +304,7 @@ describe('Multiple accounts participating in same auction', function() {
         await wallet.sendFinalize(name, {account: 'bob'});
       }, {
         name: 'Error',
-        message: `Account does not own: "${name}".`
+        message: `Account does not own name: ${name}.`
       });
     });
 
@@ -340,7 +337,7 @@ describe('Multiple accounts participating in same auction', function() {
         await wallet.sendCancel(name, {account: 'bob'});
       }, {
         name: 'Error',
-        message: `Account does not own: "${name}".`
+        message: `Account does not own name: ${name}.`
       });
     });
 
@@ -373,7 +370,7 @@ describe('Multiple accounts participating in same auction', function() {
         await wallet.sendRevoke(name, {account: 'bob'});
       }, {
         name: 'Error',
-        message: `Account does not own: "${name}".`
+        message: `Account does not own name: ${name}.`
       });
     });
 

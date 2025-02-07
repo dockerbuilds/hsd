@@ -1,6 +1,3 @@
-/* eslint-env mocha */
-/* eslint prefer-arrow-callback: "off" */
-
 'use strict';
 
 const assert = require('bsert');
@@ -10,12 +7,13 @@ const Chain = require('../lib/blockchain/chain');
 const BlockStore = require('../lib/blockstore/level');
 const Miner = require('../lib/mining/miner');
 const MemWallet = require('./util/memwallet');
-const ownership = require('../lib/covenants/ownership');
+const {ownership} = require('../lib/covenants/ownership');
 const Address = require('../lib/primitives/address');
 const Network = require('../lib/protocol/network');
 const rules = require('../lib/covenants/rules');
 const {Resource} = require('../lib/dns/resource');
 const AirdropProof = require('../lib/primitives/airdropproof');
+const {CachedStubResolver, STUB_SERVERS} = require('./util/stub');
 
 const network = Network.get('regtest');
 
@@ -45,6 +43,8 @@ const cpu = miner.cpu;
 const wallet = new MemWallet({
   network
 });
+
+const GNAME_SIZE = 10;
 
 wallet.getNameStatus = async (nameHash) => {
   assert(Buffer.isBuffer(nameHash));
@@ -92,8 +92,13 @@ async function mineBlocks(n, label) {
 }
 
 describe('Checkpoints', function() {
+  const originalResolver = ownership.Resolver;
+  const originalServers = ownership.servers;
+
   before(async () => {
     ownership.ignore = true;
+    ownership.Resolver = CachedStubResolver;
+    ownership.servers = STUB_SERVERS;
 
     await blocks.open();
     await chainGenerator.open();
@@ -101,11 +106,13 @@ describe('Checkpoints', function() {
   });
 
   after(async () => {
+    ownership.ignore = false;
+    ownership.Resolver = originalResolver;
+    ownership.servers = originalServers;
+
     await miner.close();
     await chainGenerator.close();
     await blocks.close();
-
-    ownership.ignore = false;
   });
 
   it('should add addrs to miner', async () => {
@@ -120,6 +127,8 @@ describe('Checkpoints', function() {
   });
 
   it('should CLAIM and REGISTER a reserved name', async () => {
+    this.timeout(10000);
+
     const claim = await wallet.fakeClaim('cloudflare');
 
     await mineBlock(null, [claim], null, 'claim');
@@ -158,11 +167,11 @@ describe('Checkpoints', function() {
 
   it('should win names in auction', async () => {
     // Only one bid, 0-value name
-    const name1 = rules.grindName(5, chainGenerator.height - 5, network);
+    const name1 = rules.grindName(GNAME_SIZE, chainGenerator.height - 5, network);
     // Two bids, name will have a value
-    const name2 = rules.grindName(5, chainGenerator.height - 5, network);
+    const name2 = rules.grindName(GNAME_SIZE, chainGenerator.height - 5, network);
     // Two bids, but wallet will not REGISTER
-    const name3 = rules.grindName(5, chainGenerator.height - 5, network);
+    const name3 = rules.grindName(GNAME_SIZE, chainGenerator.height - 5, network);
 
     const open1 = await wallet.sendOpen(name1);
     const open2 = await wallet.sendOpen(name2);
@@ -221,7 +230,7 @@ describe('Checkpoints', function() {
   });
 
   it('should bid in multiple blocks', async () => {
-    const name = rules.grindName(5, chainGenerator.height - 5, network);
+    const name = rules.grindName(GNAME_SIZE, chainGenerator.height - 5, network);
 
     const open = await wallet.sendOpen(name);
 
@@ -369,7 +378,7 @@ describe('Checkpoints', function() {
       let invalidBlockEntry;
 
       before(async () => {
-        name = rules.grindName(5, chainGenerator.height - 5, network);
+        name = rules.grindName(GNAME_SIZE, chainGenerator.height - 5, network);
       });
 
       after(async () => {

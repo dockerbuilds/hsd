@@ -1,7 +1,3 @@
-/* eslint-env mocha */
-/* eslint prefer-arrow-callback: "off" */
-/* eslint no-return-assign: "off" */
-
 'use strict';
 
 const assert = require('bsert');
@@ -12,15 +8,18 @@ const Miner = require('../lib/mining/miner');
 const MemWallet = require('./util/memwallet');
 const Network = require('../lib/protocol/network');
 const rules = require('../lib/covenants/rules');
-const ownership = require('../lib/covenants/ownership');
+const {ownership} = require('../lib/covenants/ownership');
+const {CachedStubResolver, STUB_SERVERS} = require('./util/stub');
 
 const network = Network.get('regtest');
-const NAME1 = rules.grindName(10, 20, network);
-const NAME2 = rules.grindName(10, 20, network);
+const GNAME_SIZE = 10;
+const NAME1 = rules.grindName(GNAME_SIZE, 20, network);
+const NAME2 = rules.grindName(GNAME_SIZE, 20, network);
 
 const workers = new WorkerPool({
   // Must be disabled for `ownership.ignore`.
-  enabled: false
+  enabled: false,
+  size: 2
 });
 
 function createNode() {
@@ -60,9 +59,7 @@ function createNode() {
       wallet.getNameStatus = async (nameHash) => {
         assert(Buffer.isBuffer(nameHash));
         const height = chain.height + 1;
-        const state = await chain.getNextState();
-        const hardened = state.hasHardening();
-        return chain.db.getNameStatus(nameHash, height, hardened);
+        return chain.db.getNameStatus(nameHash, height);
       };
 
       return wallet;
@@ -72,6 +69,19 @@ function createNode() {
 
 describe('Auction', function() {
   this.timeout(15000);
+
+  const originalResolver = ownership.Resolver;
+  const originalServers = ownership.servers;
+
+  before(() => {
+    ownership.Resolver = CachedStubResolver;
+    ownership.servers = STUB_SERVERS;
+  });
+
+  after(() => {
+    ownership.Resolver = originalResolver;
+    ownership.servers = originalServers;
+  });
 
   describe('Vickrey Auction', function() {
     const node = createNode();
@@ -141,8 +151,8 @@ describe('Auction', function() {
       assert(await chain.add(block));
     });
 
-    it('should mine 10 blocks', async () => {
-      for (let i = 0; i < 10; i++) {
+    it('should mine through the bidding period', async () => {
+      for (let i = 0; i < network.names.biddingPeriod; i++) {
         const block = await cpu.mineBlock();
         assert(block);
         assert(await chain.add(block));
@@ -163,8 +173,8 @@ describe('Auction', function() {
       assert(await chain.add(block));
     });
 
-    it('should mine 20 blocks', async () => {
-      for (let i = 0; i < 20; i++) {
+    it('should mine through the reveal period', async () => {
+      for (let i = 0; i < network.names.revealPeriod; i++) {
         const block = await cpu.mineBlock();
         assert(block);
         assert(await chain.add(block));
@@ -188,8 +198,8 @@ describe('Auction', function() {
       assert(await chain.add(block));
     });
 
-    it('should mine 10 blocks', async () => {
-      for (let i = 0; i < 10; i++) {
+    it('should mine a tree interval', async () => {
+      for (let i = 0; i < network.names.treeInterval; i++) {
         const block = await cpu.mineBlock();
         assert(block);
         assert(await chain.add(block));
@@ -253,8 +263,8 @@ describe('Auction', function() {
       assert.strictEqual(err.reason, 'bad-renewal-premature');
     });
 
-    it('should mine 10 blocks', async () => {
-      for (let i = 0; i < 10; i++) {
+    it('should mine a tree interval', async () => {
+      for (let i = 0; i < network.names.treeInterval; i++) {
         const block = await cpu.mineBlock();
         assert(block);
         assert(await chain.add(block));
@@ -485,6 +495,8 @@ describe('Auction', function() {
   });
 
   describe('Claim', function() {
+    this.timeout(10000);
+
     const node = createNode();
     const {chain, miner, cpu, blocks} = node;
 
@@ -502,8 +514,8 @@ describe('Auction', function() {
       miner.addAddress(wallet.getReceive());
     });
 
-    it('should mine 20 blocks', async () => {
-      for (let i = 0; i < 20; i++) {
+    it('should mine a tree interval', async () => {
+      for (let i = 0; i < network.names.treeInterval; i++) {
         const block = await cpu.mineBlock();
         assert(block);
         assert(await chain.add(block));
@@ -727,8 +739,8 @@ describe('Auction', function() {
     });
     */
 
-    it('should mine 20 blocks', async () => {
-      for (let i = 0; i < 20; i++) {
+    it('should mine a tree interval', async () => {
+      for (let i = 0; i < network.names.treeInterval; i++) {
         const block = await cpu.mineBlock();
         assert(block);
         assert(await chain.add(block));
@@ -801,8 +813,8 @@ describe('Auction', function() {
       assert.strictEqual(err.reason, 'bad-finalize-maturity');
     });
 
-    it('should mine 20 blocks', async () => {
-      for (let i = 0; i < 20; i++) {
+    it('should mine through the transfer lockup period', async () => {
+      for (let i = 0; i < network.names.transferLockup; i++) {
         const block = await cpu.mineBlock();
         assert(block);
         assert(await chain.add(block));

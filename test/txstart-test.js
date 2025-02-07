@@ -1,6 +1,3 @@
-/* eslint-env mocha */
-/* eslint prefer-arrow-callback: "off" */
-
 'use strict';
 
 const assert = require('bsert');
@@ -16,7 +13,8 @@ const Block = require('../lib/primitives/block');
 const Address = require('../lib/primitives/address');
 const Script = require('../lib/script/script');
 const common = require('../lib/blockchain/common');
-const ownership = require('../lib/covenants/ownership');
+const {ownership} = require('../lib/covenants/ownership');
+const {CachedStubResolver, STUB_SERVERS} = require('./util/stub');
 const VERIFY_NONE = common.flags.VERIFY_NONE;
 
 const node = new FullNode({
@@ -44,9 +42,7 @@ node.chain.on('connect', (entry, block) => {
 wallet.getNameStatus = async (nameHash) => {
   assert(Buffer.isBuffer(nameHash));
   const height = node.chain.height + 1;
-  const state = await node.chain.getNextState();
-  const hardened = state.hasHardening();
-  return node.chain.db.getNameStatus(nameHash, height, hardened);
+  return node.chain.db.getNameStatus(nameHash, height);
 };
 
 describe('Disable TXs', function() {
@@ -54,7 +50,12 @@ describe('Disable TXs', function() {
 
   let utxo, lastTX;
 
+  const originalResolver = ownership.Resolver;
+  const originalServers = ownership.servers;
+
   before(async () => {
+    ownership.Resolver = CachedStubResolver;
+    ownership.servers = STUB_SERVERS;
     node.network.txStart = 5;
     await node.open();
 
@@ -64,8 +65,10 @@ describe('Disable TXs', function() {
   });
 
   after(async () => {
-    await node.close();
     node.network.txStart = RESET_TXSTART;
+    ownership.Resolver = originalResolver;
+    ownership.servers = originalServers;
+    await node.close();
   });
 
   it('should reject tx from mempool before txStart', async () => {
@@ -80,6 +83,8 @@ describe('Disable TXs', function() {
   });
 
   it('should reject claim from mempool before txStart', async () => {
+    this.timeout(10000);
+
     const claim = await wallet.fakeClaim('cloudflare');
 
     try {
@@ -187,6 +192,8 @@ describe('Disable TXs', function() {
   });
 
   it('should allow claim in mempool one block before txStart', async () => {
+    this.timeout(10000);
+
     const claim = await wallet.fakeClaim('cloudflare');
 
     try {

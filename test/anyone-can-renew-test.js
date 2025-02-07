@@ -1,6 +1,3 @@
-/* eslint-env mocha */
-/* eslint prefer-arrow-callback: "off" */
-
 'use strict';
 
 const assert = require('bsert');
@@ -45,7 +42,7 @@ const {wdb} = node.require('walletdb');
 let alice, aliceReceive;
 let bob, bobReceive;
 
-const name = rules.grindName(5, 1, network);
+const name = rules.grindName(10, 1, network);
 const nameHash = rules.hashName(name);
 let heightBeforeOpen, heightBeforeRegister, heightBeforeFinalize;
 let coin;
@@ -108,7 +105,7 @@ describe('Anyone-can-renew address', function() {
   it('should win name with Alice\'s wallet', async () => {
     heightBeforeOpen = node.chain.height;
 
-    await alice.sendOpen(name, false);
+    await alice.sendOpen(name);
     await mineBlocks(network.names.treeInterval + 1);
 
     await alice.sendBid(name, 100000, 200000);
@@ -164,14 +161,14 @@ describe('Anyone-can-renew address', function() {
   });
 
   it('should not be owned by either wallet', async  () => {
-    assert.rejects(
+    await assert.rejects(
       alice.sendTransfer(name, aliceReceive),
-      {message: `Wallet does not own: "${name}".`}
+      {message: `Wallet does not own name: ${name}.`}
     );
 
-    assert.rejects(
+    await assert.rejects(
       bob.sendTransfer(name, bobReceive),
-      {message: 'Auction not found.'}
+      {message: `Auction not found: ${name}.`}
     );
   });
 
@@ -187,10 +184,12 @@ describe('Anyone-can-renew address', function() {
       value: coin.value,
       address: coin.address
     }));
-    mtx.output(0).covenant.type = rules.types.RENEW;
-    mtx.output(0).covenant.pushHash(nameHash);
-    mtx.output(0).covenant.pushU32(heightBeforeOpen + 1);
-    mtx.output(0).covenant.pushHash(node.chain.tip.hash);
+
+    mtx.output(0).covenant.setRenew(
+      nameHash,
+      heightBeforeOpen + 1,
+      node.chain.tip.hash
+    );
 
     await alice.fund(mtx, {coins: [coin]});
     await alice.finalize(mtx, {coins: [coin]});
@@ -215,10 +214,12 @@ describe('Anyone-can-renew address', function() {
       value: coin.value,
       address: coin.address
     }));
-    mtx.output(0).covenant.type = rules.types.UPDATE;
-    mtx.output(0).covenant.pushHash(nameHash);
-    mtx.output(0).covenant.pushU32(heightBeforeOpen + 1);
-    mtx.output(0).covenant.push(Buffer.alloc(1));
+
+    mtx.output(0).covenant.setUpdate(
+      nameHash,
+      heightBeforeOpen + 1,
+      Buffer.alloc(1)
+    );
 
     await alice.fund(mtx, {coins: [coin]});
     await alice.finalize(mtx, {coins: [coin]});
@@ -243,11 +244,12 @@ describe('Anyone-can-renew address', function() {
       value: coin.value,
       address: coin.address
     }));
-    mtx.output(0).covenant.type = rules.types.TRANSFER;
-    mtx.output(0).covenant.pushHash(nameHash);
-    mtx.output(0).covenant.pushU32(heightBeforeOpen + 1);
-    mtx.output(0).covenant.pushU8(0);
-    mtx.output(0).covenant.push(Buffer.alloc(20));
+
+    mtx.output(0).covenant.setTransfer(
+      nameHash,
+      heightBeforeOpen + 1,
+      new Address({ version: 0, hash: Buffer.alloc(20) })
+    );
 
     await alice.fund(mtx, {coins: [coin]});
     await alice.finalize(mtx, {coins: [coin]});
@@ -272,10 +274,12 @@ describe('Anyone-can-renew address', function() {
       value: coin.value,
       address: coin.address
     }));
-    mtx.output(0).covenant.type = rules.types.RENEW;
-    mtx.output(0).covenant.pushHash(nameHash);
-    mtx.output(0).covenant.pushU32(heightBeforeOpen + 1);
-    mtx.output(0).covenant.pushHash(node.chain.tip.hash);
+
+    mtx.output(0).covenant.setRenew(
+      nameHash,
+      heightBeforeOpen + 1,
+      node.chain.tip.hash
+    );
 
     await alice.fund(mtx, {coins: [coin]});
     await alice.finalize(mtx, {coins: [coin]});
@@ -297,10 +301,12 @@ describe('Anyone-can-renew address', function() {
       value: coin.value,
       address: coin.address
     }));
-    mtx.output(0).covenant.type = rules.types.RENEW;
-    mtx.output(0).covenant.pushHash(nameHash);
-    mtx.output(0).covenant.pushU32(heightBeforeOpen + 1);
-    mtx.output(0).covenant.pushHash(node.chain.tip.hash);
+
+    mtx.output(0).covenant.setRenew(
+      nameHash,
+      heightBeforeOpen + 1,
+      node.chain.tip.hash
+    );
 
     await bob.fund(mtx, {coins: [coin]});
     await bob.finalize(mtx, {coins: [coin]});

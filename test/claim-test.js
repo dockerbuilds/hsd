@@ -1,7 +1,3 @@
-/* eslint-env mocha */
-/* eslint prefer-arrow-callback: "off" */
-/* eslint no-implicit-coercion: "off" */
-
 'use strict';
 
 const assert = require('bsert');
@@ -10,9 +6,10 @@ const Address = require('../lib/primitives/address');
 const Claim = require('../lib/primitives/claim');
 const FullNode = require('../lib/node/fullnode');
 const consensus = require('../lib/protocol/consensus');
-const ownership = require('../lib/covenants/ownership');
+const {ownership} = require('../lib/covenants/ownership');
 const reserved = require('../lib/covenants/reserved');
 const {Resource} = require('../lib/dns/resource');
+const {CachedStubResolver, STUB_SERVERS} = require('./util/stub');
 
 const network = Network.get('regtest');
 
@@ -49,7 +46,15 @@ async function mineBlocks(n, addr) {
 }
 
 describe('Reserved Name Claims', function() {
+  this.timeout(10000);
+
+  const originalResolver = ownership.Resolver;
+  const originalServers = ownership.servers;
+
   before(async () => {
+    ownership.Resolver = CachedStubResolver;
+    ownership.servers = STUB_SERVERS;
+
     await node.open();
 
     wallet = await wdb.create();
@@ -57,6 +62,8 @@ describe('Reserved Name Claims', function() {
   });
 
   after(async () => {
+    ownership.Resolver = originalResolver;
+    ownership.servers = originalServers;
     await node.close();
   });
 

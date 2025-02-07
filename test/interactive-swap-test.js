@@ -1,6 +1,3 @@
-/* eslint-env mocha */
-/* eslint prefer-arrow-callback: "off" */
-
 'use strict';
 
 const assert = require('bsert');
@@ -13,7 +10,7 @@ const Script = require('../lib/script/script');
 const rules = require('../lib/covenants/rules');
 const {types} = rules;
 const {Resource} = require('../lib/dns/resource');
-const {WalletClient} = require('hs-client');
+const WalletClient = require('../lib/client/wallet');
 
 const network = Network.get('regtest');
 
@@ -41,7 +38,7 @@ let alice, bob, aliceReceive, bobReceive;
 let aliceOriginalBalance, bobOriginalBalance, bobFee;
 
 // These are data that will be communicated between Alice and Bob
-const name = rules.grindName(5, 1, network);
+const name = rules.grindName(10, 1, network);
 const nameHash = rules.hashName(name);
 const price = 1234567; // 1.234567 HNS
 let blob;
@@ -86,7 +83,7 @@ describe('Interactive name swap', function() {
   });
 
   it('should win name with Alice\'s wallet', async () => {
-    await alice.sendOpen(name, false);
+    await alice.sendOpen(name);
     await mineBlocks(network.names.treeInterval + 1);
 
     await alice.sendBid(name, 100000, 200000);
@@ -105,10 +102,10 @@ describe('Interactive name swap', function() {
   });
 
   it('should not be able to send a TRANSFER before REGISTER', async () => {
-    assert.rejects(async () => {
+    await assert.rejects(async () => {
       await alice.sendTransfer(name, bobReceive);
     }, {
-      message: 'Name must be registered.'
+      message: `Name is not registered: ${name}.`
     });
   });
 
@@ -166,14 +163,15 @@ describe('Interactive name swap', function() {
     const output0 = new Output();
     output0.value = coin.value;
     output0.address = bobReceive;
-    output0.covenant.type = types.FINALIZE;
-    output0.covenant.pushHash(nameHash);
-    output0.covenant.pushU32(ns.height);
-    output0.covenant.push(Buffer.from(name, 'ascii'));
-    output0.covenant.pushU8(0); // flags, may be required if name was CLAIMed
-    output0.covenant.pushU32(ns.claimed);
-    output0.covenant.pushU32(ns.renewals);
-    output0.covenant.pushHash(await wdb.getRenewalBlock());
+    output0.covenant.setFinalize(
+      nameHash,
+      ns.height,
+      Buffer.from(name, 'ascii'),
+      0, // flags, may be required if name was CLAIMed
+      ns.claimed,
+      ns.renewals,
+      await wdb.getRenewalBlock()
+    );
 
     const output1 = new Output();
     output1.address = aliceReceive;
